@@ -1,0 +1,23 @@
+# Serviço systemd do nó sensor (inicia junto com o Raspberry).
+# Instalação (no Pi, dentro da pasta do projeto):
+#   cp deploy/pest-node.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now pest-node
+# Logs: journalctl -u pest-node -f
+[Unit]
+Description=Pest node (client_raspberry_cv)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/dbrito/Desktop/client_raspberry_cv
+ExecStart=/home/dbrito/Desktop/client_raspberry_cv/.venv/bin/python main.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

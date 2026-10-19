@@ -58,6 +58,10 @@ class CameraConfig:
     max_fps: float = 10.0  # limita o ISP; a inferência é bem mais lenta que isso
     jpeg_quality: int = 85
     fake_images_dir: str = ""  # se preenchido, usa a câmera falsa (pasta de imagens)
+    # Leitura do QR Code do servidor:
+    qr_interval_s: float = 0.05  # pausa entre tentativas na leitura inicial (0 = no ritmo da câmera)
+    qr_timeout_s: float = 120.0  # quanto esperar o QR na inicialização; depois segue e procura a cada quadro
+    qr_scale: float = 0.5  # reduz o quadro antes de decodificar (1.0 = tamanho original; mais rápido no Pi)
 
 
 PROCESSING_MODES = ("local", "server")
@@ -220,6 +224,9 @@ def validate(cfg: Config) -> None:
              "camera.width/height fora da faixa do sensor (máx. 2592x1944)")
     _require(0.5 <= c.max_fps <= 60, "camera.max_fps deve estar entre 0.5 e 60")
     _require(10 <= c.jpeg_quality <= 100, "camera.jpeg_quality deve estar entre 10 e 100")
+    _require(0 <= c.qr_interval_s <= 10, "camera.qr_interval_s deve estar entre 0 e 10 s")
+    _require(1 <= c.qr_timeout_s <= 3600, "camera.qr_timeout_s deve estar entre 1 e 3600 s")
+    _require(0.1 <= c.qr_scale <= 1.0, "camera.qr_scale deve estar entre 0.1 e 1.0")
     _require(0.5 <= i.capture_interval_s <= 3600, "inference.capture_interval_s deve estar entre 0.5 e 3600 s")
     _require(i.mode in PROCESSING_MODES, f"inference.mode deve ser um de: {', '.join(PROCESSING_MODES)}")
     _require(i.server_timeout_s > 0, "inference.server_timeout_s deve ser > 0")

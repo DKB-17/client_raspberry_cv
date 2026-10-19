@@ -17,7 +17,10 @@
     "height": 972,
     "max_fps": 10.0,
     "jpeg_quality": 85,
-    "fake_images_dir": ""
+    "fake_images_dir": "",
+    "qr_interval_s": 0.05,
+    "qr_timeout_s": 120.0,
+    "qr_scale": 0.5
   },
   "inference": {
     "capture_interval_s": 5.0,

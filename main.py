@@ -45,7 +45,6 @@ from pest_node.thermal import ThermalSensor  # noqa: E402
 
 log = get_logger("main")
 
-QR_TIMEOUT_S = 120.0  # tempo de leitura do QR na inicialização; depois segue e continua procurando
 CAMERA_RETRY_S = 30.0
 
 
@@ -73,10 +72,15 @@ async def abrir_camera(node: Node) -> None:
         await asyncio.sleep(CAMERA_RETRY_S)  # enquanto isso o WebSocket do app segue atendendo
 
 
-async def descobrir_servidor(node: Node, timeout_s: float = QR_TIMEOUT_S) -> None:
-    log_event(log, "qr_scanning", timeout_s=timeout_s, hint="mostre o QR do servidor à câmera (~1 m)")
+async def descobrir_servidor(node: Node) -> None:
+    """Tempo, pausa e redução da leitura: camera.qr_timeout_s / qr_interval_s / qr_scale no config.json."""
+    c = node.cfg.camera
+    timeout_s = c.qr_timeout_s
+    log_event(log, "qr_scanning", timeout_s=timeout_s, interval_s=c.qr_interval_s, scale=c.qr_scale,
+              hint="mostre o QR do servidor à câmera (~1 m)")
     try:
-        info = await asyncio.to_thread(scan_for_server_url, node.camera.capture, timeout_s)
+        info = await asyncio.to_thread(scan_for_server_url, node.camera.capture, timeout_s,
+                                       c.qr_interval_s, c.qr_scale)
     except TimeoutError:
         log_event(log, "qr_not_found", level=30,
                   hint="seguindo sem servidor; o QR continua sendo procurado a cada quadro")

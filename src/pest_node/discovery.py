@@ -107,12 +107,22 @@ def http_base_url(ws_url: str) -> str:
 _detector: cv2.QRCodeDetector | None = None
 
 
-def decode_qr(frame_bgr: np.ndarray) -> str | None:
-    """Tenta ler um QR no quadro. Retorna o texto ou None."""
+QR_MIN_SCALED_WIDTH = 640  # abaixo disso não reduz: o QR a ~1 m ficaria pequeno demais
+
+
+def decode_qr(frame_bgr: np.ndarray, scale: float = 1.0) -> str | None:
+    """Tenta ler um QR no quadro. Retorna o texto ou None.
+
+    `scale` < 1 reduz o quadro antes de decodificar (camera.qr_scale), o que
+    corta bastante o tempo no Pi 3; nunca reduz abaixo de QR_MIN_SCALED_WIDTH.
+    """
     global _detector
     if _detector is None:
         _detector = cv2.QRCodeDetector()
     gray = frame_bgr if frame_bgr.ndim == 2 else cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    scale = max(scale, min(1.0, QR_MIN_SCALED_WIDTH / gray.shape[1]))
+    if scale < 1.0:
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     try:
         text, points, _ = _detector.detectAndDecode(gray)
     except cv2.error:
@@ -121,7 +131,7 @@ def decode_qr(frame_bgr: np.ndarray) -> str | None:
 
 
 def scan_for_server_url(capture: Callable[[], np.ndarray], timeout_s: float = 120.0,
-                        interval_s: float = 0.3) -> ServerInfo:
+                        interval_s: float = 0.05, scale: float = 1.0) -> ServerInfo:
     """Lê quadros até achar um QR com URL válida ou estourar o tempo.
 
     QRs com conteúdo inválido são registrados e ignorados (continua procurando).
@@ -129,7 +139,7 @@ def scan_for_server_url(capture: Callable[[], np.ndarray], timeout_s: float = 12
     deadline = time.monotonic() + timeout_s
     last_invalid: str | None = None
     while time.monotonic() < deadline:
-        text = decode_qr(capture())
+        text = decode_qr(capture(), scale)
         if text:
             try:
                 info = parse_server_qr(text)
@@ -139,5 +149,6 @@ def scan_for_server_url(capture: Callable[[], np.ndarray], timeout_s: float = 12
                 if text != last_invalid:
                     log_event(log, "qr_invalid", level=30, content=text[:80], reason=str(exc))
                     last_invalid = text
-        time.sleep(interval_s)
+        if interval_s > 0:
+            time.sleep(interval_s)
     raise TimeoutError(f"nenhum QR Code válido lido em {timeout_s:.0f} s")

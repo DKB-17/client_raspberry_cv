@@ -162,7 +162,7 @@ class Node:
         return result.detections, "local", jpeg
 
     async def _try_discover(self, frame: np.ndarray) -> None:
-        text = await asyncio.to_thread(decode_qr, frame)
+        text = await asyncio.to_thread(decode_qr, frame, self.cfg.camera.qr_scale)
         if not text:
             return
         try:
