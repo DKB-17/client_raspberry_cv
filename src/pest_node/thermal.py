@@ -1,4 +1,4 @@
-"""Temperatura, throttling e controle adaptativo de carga.
+"""Leitura de temperatura e throttling (apenas para logs e autoteste; não altera a coleta).
 
 `vcgencmd get_throttled` devolve um bitmask (documentação Raspberry Pi):
   bit 0  subtensão agora             bit 16 houve subtensão
@@ -16,13 +16,9 @@ import shutil
 import subprocess
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
-
-from .logging_setup import get_logger, log_event
-
-log = get_logger("thermal")
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,81 +142,3 @@ class SimulatedSensor:
                 self._it = iter(self.readings)
                 temp, raw = next(self._it)
         return ThermalSample(time.time(), temp, ThrottleFlags(raw) if raw is not None else None, None)
-
-
-# --------------------------------------------------------------------------- #
-#  Controle adaptativo
-# --------------------------------------------------------------------------- #
-@dataclass
-class AdaptiveController:
-    """Ajusta o intervalo entre inferências conforme temperatura e throttling.
-
-    - "Pressão" (temp >= temp_high_c, throttling/limite térmico ou subtensão,
-      conforme configuração): multiplica o intervalo por slowdown_factor a cada
-      leitura, até max_interval_s.
-    - Alívio (temp <= temp_resume_c e nenhum bit ativo): divide pelo mesmo fator
-      a cada leitura até voltar ao intervalo base. Entre os dois limiares, mantém
-      (histerese).
-    Aumentar o intervalo equivale a pular quadros: a câmera continua rodando,
-    apenas menos quadros são inferidos. O intervalo base é o intervalo de
-    captura (inference.capture_interval_s, vindo do QR do servidor).
-    """
-
-    base_interval_s: float
-    temp_high_c: float = 70.0
-    temp_resume_c: float = 65.0
-    slowdown_factor: float = 2.0
-    max_interval_s: float = 30.0
-    react_to_throttling: bool = True
-    react_to_under_voltage: bool = True
-    interval_s: float = field(init=False)
-    reason: str = field(init=False, default="normal")
-    last_sample: ThermalSample | None = field(init=False, default=None)
-
-    def __post_init__(self) -> None:
-        self.interval_s = self.base_interval_s
-        self._under_pressure = False
-
-    @property
-    def degraded(self) -> bool:
-        return self._under_pressure or self.interval_s > self.base_interval_s * 1.0001
-
-    def set_base_interval(self, seconds: float) -> None:
-        """Novo intervalo de captura (ex.: QR relido). Mantém a redução térmica atual."""
-        factor = self.interval_s / self.base_interval_s
-        self.base_interval_s = seconds
-        self.interval_s = min(seconds * factor, max(self.max_interval_s, seconds))
-
-    def _pressure(self, s: ThermalSample) -> list[str]:
-        causes: list[str] = []
-        if s.temp_c is not None and s.temp_c >= self.temp_high_c:
-            causes.append(f"temp>={self.temp_high_c:g}C")
-        if s.flags is not None:
-            if self.react_to_throttling and (s.flags.throttled_now or s.flags.soft_temp_limit_now
-                                             or s.flags.freq_capped_now):
-                causes.append("throttling")
-            if self.react_to_under_voltage and s.flags.under_voltage_now:
-                causes.append("subtensao")
-        return causes
-
-    def _relieved(self, s: ThermalSample) -> bool:
-        cool = s.temp_c is None or s.temp_c <= self.temp_resume_c
-        return cool and not self._pressure(s)
-
-    def update(self, sample: ThermalSample) -> float:
-        self.last_sample = sample
-        previous = self.interval_s
-        causes = self._pressure(sample)
-        self._under_pressure = bool(causes)
-        if causes:
-            ceiling = max(self.max_interval_s, self.base_interval_s)
-            self.interval_s = min(self.interval_s * self.slowdown_factor, ceiling)
-            self.reason = "+".join(causes)
-        elif self._relieved(sample) and self.degraded:
-            self.interval_s = max(self.interval_s / self.slowdown_factor, self.base_interval_s)
-            self.reason = "normal" if not self.degraded else "resfriando"
-        if self.interval_s != previous:
-            log_event(log, "load_adjusted", level=30 if self.interval_s > previous else 20,
-                      interval_s=round(self.interval_s, 2), previous_s=round(previous, 2), reason=self.reason,
-                      temp_c=sample.temp_c, throttled=sample.flags.describe() if sample.flags else None)
-        return self.interval_s

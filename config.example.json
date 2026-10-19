@@ -2,6 +2,7 @@
   "server_ws_url": "",
   "node_id": "",
   "model": {
+    "backend": "onnx",
     "path": "models/teste2.onnx",
     "conf_threshold": 0.25,
     "iou_threshold": 0.7,
@@ -20,17 +21,8 @@
   },
   "inference": {
     "capture_interval_s": 5.0,
-    "mode": "auto",
+    "mode": "local",
     "server_timeout_s": 15.0
-  },
-  "thermal": {
-    "poll_interval_s": 5.0,
-    "temp_high_c": 70.0,
-    "temp_resume_c": 65.0,
-    "react_to_throttling": true,
-    "react_to_under_voltage": true,
-    "slowdown_factor": 2.0,
-    "max_interval_s": 30.0
   },
   "alerts": {
     "threshold": 0.6,

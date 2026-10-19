@@ -1,8 +1,7 @@
 """Serviços do nó usados pelo main.py.
 
 O main.py conduz o fluxo (câmera -> QR -> coleta). Esta classe reúne as peças:
-modelo, fila de alertas, cliente do servidor, WebSocket do app, controle
-térmico e métricas, e expõe `collect_once()`, que é UM ciclo da coleta:
+modelo, fila de alertas, cliente do servidor, WebSocket do app e métricas, e expõe `collect_once()`, que é UM ciclo da coleta:
 captura -> análise (YOLO no Pi ou no servidor) -> alerta.
 """
 
@@ -28,7 +27,7 @@ from .models import AlertEvent, Detection
 from .outbox import Outbox
 from .protocol import ImagePacket, new_packet_id
 from .sysmetrics import CpuMeter, mem_available_mb, process_rss_mb
-from .thermal import AdaptiveController, ThermalSensor, VcgencmdSensor
+from .thermal import ThermalSample, ThermalSensor, VcgencmdSensor
 from .ws_server import AppGateway, InferenceWorker
 
 log = get_logger("runtime")
@@ -43,11 +42,6 @@ class Node:
                                             cfg.resolve(c.fake_images_dir) if c.fake_images_dir else None)
         self.sensor = sensor or VcgencmdSensor()
         self.detector = detector
-        t = cfg.thermal
-        self.controller = AdaptiveController(
-            base_interval_s=cfg.inference.capture_interval_s, temp_high_c=t.temp_high_c,
-            temp_resume_c=t.temp_resume_c, slowdown_factor=t.slowdown_factor, max_interval_s=t.max_interval_s,
-            react_to_throttling=t.react_to_throttling, react_to_under_voltage=t.react_to_under_voltage)
         self.policy = AlertPolicy(cfg.alerts.threshold, cfg.alerts.cooldown_s, cfg.alerts.classes)
         self.worker = InferenceWorker()
         self.outbox: Outbox | None = None
@@ -66,12 +60,12 @@ class Node:
 
     @property
     def interval_s(self) -> float:
-        """Intervalo atual entre capturas (capture_interval_s, ampliado se aquecido)."""
-        return self.controller.interval_s
+        """Segundos entre capturas (inference.capture_interval_s, vindo do QR do servidor)."""
+        return self.cfg.inference.capture_interval_s
 
     # ------------------------------------------------------------ ciclo de vida
     async def start(self) -> None:
-        """Carrega o modelo e sobe fila, cliente, WebSocket do app, térmico e métricas."""
+        """Carrega o modelo e sobe fila, cliente, WebSocket do app e métricas."""
         cfg = self.cfg
         if self.detector is None:
             self.detector = await asyncio.to_thread(Detector.from_config, cfg)
@@ -84,8 +78,7 @@ class Node:
                                       w.max_frame_bytes, w.max_id_bytes, w.max_pending_photos,
                                       on_alert=self._on_app_photo if w.forward_alerts else None)
             await self.gateway.start()
-        self._tasks = [asyncio.create_task(self._thermal_loop(), name="thermal"),
-                       asyncio.create_task(self._metrics_loop(), name="metrics")]
+        self._tasks = [asyncio.create_task(self._metrics_loop(), name="metrics")]
 
     async def stop(self) -> None:
         for t in self._tasks:
@@ -124,7 +117,6 @@ class Node:
         self.cfg.server_ws_url = info.url
         if info.capture_interval_s is not None:
             self.cfg.inference.capture_interval_s = info.capture_interval_s
-            self.controller.set_base_interval(info.capture_interval_s)
         await asyncio.to_thread(cfgmod.save, self.cfg)
         log_event(log, "server_configured", url=info.url, capture_interval_s=self.cfg.inference.capture_interval_s)
         if self.client is not None:
@@ -151,13 +143,8 @@ class Node:
         return detections
 
     def _send_to_server(self) -> bool:
-        mode = self.cfg.inference.mode
         connected = self.client is not None and self.client.connected
-        if mode == "server":
-            return connected
-        if mode == "auto":
-            return connected and self.controller.degraded
-        return False
+        return self.cfg.inference.mode == "server" and connected
 
     async def _analyze(self, frame: np.ndarray) -> tuple[list[Detection], str, bytes | None]:
         """YOLO no servidor (quadro STREAM_, não é gravado) ou no Pi, conforme inference.mode."""
@@ -202,13 +189,7 @@ class Node:
             dets = json.dumps([d.to_wire() for d in detections], ensure_ascii=False)
             await asyncio.to_thread(self.outbox.put, event.packet_id, jpeg, dets, origin, event.created_at)
 
-    # ------------------------------------------------------------ térmico e métricas
-    async def _thermal_loop(self) -> None:
-        while True:
-            sample = await asyncio.to_thread(self.sensor.read)
-            self.controller.update(sample)
-            await asyncio.sleep(self.cfg.thermal.poll_interval_s)
-
+    # ------------------------------------------------------------ métricas
     async def _metrics_loop(self) -> None:
         last_frames, last_t = self.frames, time.monotonic()
         while True:
@@ -216,10 +197,10 @@ class Node:
             now = time.monotonic()
             fps = (self.frames - last_frames) / (now - last_t)
             last_frames, last_t = self.frames, now
-            log_event(log, "metrics", **self.snapshot(fps))
+            sample = await asyncio.to_thread(self.sensor.read)  # só registra; não altera a coleta
+            log_event(log, "metrics", **self.snapshot(fps, sample))
 
-    def snapshot(self, fps: float | None = None) -> dict[str, object]:
-        s = self.controller.last_sample
+    def snapshot(self, fps: float | None = None, s: ThermalSample | None = None) -> dict[str, object]:
         infer = list(self._infer_ms)
         e2e = list(self._e2e_ms)
         count, size = self.outbox.stats() if self.outbox else (0, 0)
@@ -229,9 +210,7 @@ class Node:
             "infer_ms_p95": round(_p95(infer), 1) if infer else None,
             "e2e_ms_avg": round(statistics.fmean(e2e), 1) if e2e else None,
             "capture_interval_s": self.cfg.inference.capture_interval_s,
-            "interval_s": round(self.controller.interval_s, 2),
             "mode": self.cfg.inference.mode,
-            "load_reason": self.controller.reason,
             "temp_c": s.temp_c if s else None,
             "throttled": s.flags.describe() if s and s.flags else None,
             "arm_mhz": s.arm_freq_mhz if s else None,

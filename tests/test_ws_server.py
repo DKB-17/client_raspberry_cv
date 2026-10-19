@@ -20,7 +20,7 @@ from pest_node.ws_server import AppGateway, InferenceWorker
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = ROOT / "models" / "teste2.onnx"
 SAMPLE_ID = "48651cd1-32b5-42a3-8dbd-93aafee47985"
-SAMPLE = ROOT.parent / "servidor_cv" / "data" / "2026-09-14" / "classified" / f"{SAMPLE_ID}.jpg"
+SAMPLE = ROOT / "tests" / "fixtures" / "sample_pest.jpg"  # Gafanhoto (dataset AgroInsect)
 
 DET = Detection(5, "Percevejo", 0.9, (1.0, 2.0, 3.0, 4.0))
 
@@ -203,8 +203,8 @@ async def test_photo_queue_full_returns_error():
     assert errors and all("fila" in m["mensagem"] for m in errors)
 
 
-@pytest.mark.skipif(not (MODEL.exists() and SAMPLE.exists()), reason="modelo ou amostra do servidor ausente")
-async def test_real_model_response_equals_server_saved_json():
+@pytest.mark.skipif(not (MODEL.exists() and SAMPLE.exists()), reason="modelo ou amostra ausente")
+async def test_real_model_response_matches_local_detector():
     det = Detector(MODEL)
     gw = await gateway(det.detect_jpeg)
     async with connect(url(gw)) as ws:
@@ -212,7 +212,7 @@ async def test_real_model_response_equals_server_saved_json():
         await recv_json(ws)
         resp = await recv_json(ws, timeout=30)
     await gw.stop()
-    saved = json.loads(SAMPLE.with_suffix(".json").read_text(encoding="utf-8"))
+    expected = [d.to_wire() for d in det.detect_jpeg(SAMPLE.read_bytes()).detections]
     assert resp["mensagem"] == "1 detecção(ões) encontrada(s)"
-    assert [d["class_name"] for d in resp["detections"]] == [d["class_name"] for d in saved["detections"]]
-    np.testing.assert_allclose(resp["detections"][0]["bbox"], saved["detections"][0]["bbox"], atol=2)
+    assert resp["detections"] == expected
+    assert expected[0]["class_name"] == "Gafanhoto"

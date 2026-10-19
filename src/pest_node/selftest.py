@@ -54,7 +54,7 @@ def check_platform() -> tuple[str, str]:
     except OSError:
         pass
     status = OK if arch in {"aarch64", "arm64", "AMD64", "x86_64"} else WARN
-    note = "" if status == OK else " (32 bits: wheels do onnxruntime podem não existir)"
+    note = "" if status == OK else " (32 bits: wheels do onnxruntime/ai-edge-litert podem não existir)"
     return status, f"{model or platform.node()} | {arch} | Python {py}{note}"
 
 
@@ -73,8 +73,9 @@ def check_model(cfg: Config) -> tuple[str, str]:
     t = time.perf_counter()
     det.detect(blank)
     ms = (time.perf_counter() - t) * 1e3
-    return OK, (f"{m.path} | entrada {det.imgsz}x{det.imgsz} | saída {list(det.output_shape)} ({det.layout}) | "
-                f"{len(det.class_names)} classes | inferência {ms:.0f} ms com {m.intra_op_num_threads} thread(s)")
+    return OK, (f"{m.backend} | {m.path} | entrada {det.imgsz}x{det.imgsz} | saída {list(det.output_shape)} "
+                f"({det.layout}) | {len(det.class_names)} classes | inferência {ms:.0f} ms com "
+                f"{det.backend.threads} thread(s)")
 
 
 def check_camera(cfg: Config) -> tuple[str, str]:
@@ -166,7 +167,7 @@ def run_selftest(cfg: Config, path) -> int:
     checks = [
         _run("Plataforma", check_platform),
         _run("Configuração", lambda: check_config(cfg, path)),
-        _run("Modelo ONNX", lambda: check_model(cfg)),
+        _run("Modelo", lambda: check_model(cfg)),
         _run("Câmera", lambda: check_camera(cfg)),
         _run("Sensores térmicos", check_thermal),
         _run("Rede", lambda: check_network(cfg)),

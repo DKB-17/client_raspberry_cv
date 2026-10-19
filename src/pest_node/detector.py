@@ -1,4 +1,7 @@
-"""Detector YOLO26n via ONNX Runtime (somente CPU).
+"""Detector YOLO26n (somente CPU), independente do runtime do modelo.
+
+O runtime é um adapter de backends.py, escolhido pela tag do .env
+(PEST_MODEL_BACKEND=onnx | litert). Aqui ficam só o pré/pós-processamento YOLO.
 
 Pré-processamento idêntico ao do Ultralytics (usado pelo servidor):
   letterbox centralizado para imgsz x imgsz com cinza (114,114,114),
@@ -20,8 +23,8 @@ from typing import TYPE_CHECKING, Literal
 
 import cv2
 import numpy as np
-import onnxruntime as ort
 
+from .backends import ModelError, create_backend, resolve_imgsz  # noqa: F401 (ModelError reexportado)
 from .logging_setup import get_logger, log_event
 from .models import Detection, InferenceResult
 
@@ -34,10 +37,6 @@ OutputLayout = Literal["channels_first", "channels_last", "end2end"]
 LETTERBOX_COLOR = (114, 114, 114)
 _MAX_WH = 7680.0  # deslocamento por classe no NMS (mesmo valor do Ultralytics)
 _MAX_NMS_CANDIDATES = 30000
-
-
-class ModelError(RuntimeError):
-    pass
 
 
 # --------------------------------------------------------------------------- #
@@ -89,6 +88,26 @@ def xywh_to_xyxy(xywh: np.ndarray) -> np.ndarray:
     return out
 
 
+def denormalize_boxes(output: np.ndarray, layout: OutputLayout, size: int) -> np.ndarray:
+    """Caixas em 0..1 (export TFLite do Ultralytics) -> pixels do letterbox (in-place)."""
+    if layout == "channels_first":
+        output[:, :4, :] *= size
+    else:
+        output[..., :4] *= size
+    return output
+
+
+def boxes_are_normalized(output: np.ndarray, layout: OutputLayout, hint: bool | None = None) -> bool:
+    """Se as coordenadas da saída estão em 0..1. `hint` do backend vence; None = pela saída.
+
+    Em pixels, as caixas de um letterbox >= 32 px passam de 2 com folga; normalizadas, não.
+    """
+    if hint is not None:
+        return hint
+    coords = output[0, :4, :] if layout == "channels_first" else output[0, :, :4]
+    return coords.size == 0 or float(np.abs(coords).max()) <= 2.0
+
+
 def nms(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> np.ndarray:
     """NMS guloso em numpy. Retorna índices mantidos em ordem decrescente de score."""
     order = scores.argsort()[::-1]
@@ -111,7 +130,7 @@ def nms(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> np.ndarr
 
 def detect_layout(shape: tuple[int, ...], num_classes: int | None,
                   end2end_hint: bool | None = None) -> OutputLayout:
-    """Escolhe o pós-processamento pela forma real da saída do ONNX.
+    """Escolhe o pós-processamento pela forma real da saída do modelo.
 
     `end2end_hint` vem dos metadados do Ultralytics e só desempata o caso
     ambíguo [1, N, 6] com 2 classes.
@@ -180,40 +199,20 @@ def parse_class_names(meta: dict[str, str]) -> list[str] | None:
 class Detector:
     @classmethod
     def from_config(cls, cfg: Config) -> Detector:
-        """Cria o detector a partir da seção "model" do config.json."""
+        """Cria o detector a partir da seção "model" do config.json (+ overrides do .env)."""
         m = cfg.model
         return cls(cfg.resolve(m.path), m.conf_threshold, m.iou_threshold, m.max_detections,
-                   m.intra_op_num_threads, m.inter_op_num_threads, m.class_names, m.imgsz)
+                   m.intra_op_num_threads, m.inter_op_num_threads, m.class_names, m.imgsz, m.backend)
 
     def __init__(self, model_path: Path, conf_threshold: float = 0.25, iou_threshold: float = 0.7,
                  max_detections: int = 300, intra_op_num_threads: int = 2, inter_op_num_threads: int = 1,
-                 class_names: list[str] | None = None, imgsz: int = 0) -> None:
-        if not Path(model_path).is_file():
-            raise ModelError(f"modelo não encontrado: {model_path}")
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads = intra_op_num_threads
-        opts.inter_op_num_threads = inter_op_num_threads
-        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        opts.log_severity_level = 3
-        try:
-            self.session = ort.InferenceSession(str(model_path), sess_options=opts,
-                                                providers=["CPUExecutionProvider"])
-        except Exception as exc:  # onnxruntime lança tipos variados
-            raise ModelError(f"falha ao carregar {model_path}: {exc}") from exc
+                 class_names: list[str] | None = None, imgsz: int = 0, backend: str = "onnx") -> None:
+        self.backend = create_backend(backend, Path(model_path), intra_op_num_threads,
+                                      inter_op_num_threads, imgsz)
+        self.imgsz = self.backend.imgsz
+        self.output_shape = tuple(self.backend.output_shape)
 
-        inp = self.session.get_inputs()[0]
-        self.input_name = inp.name
-        if len(inp.shape) != 4:
-            raise ModelError(f"entrada com forma não suportada: {inp.shape}")
-        if inp.type != "tensor(float)":
-            raise ModelError(f"entrada deve ser float32, é {inp.type}")
-        self.imgsz = self._resolve_imgsz(inp.shape, imgsz)
-        out = self.session.get_outputs()[0]
-        self.output_name = out.name
-        self.output_shape = tuple(out.shape)
-
-        meta = self.session.get_modelmeta().custom_metadata_map
+        meta = self.backend.metadata
         self.metadata = dict(meta)
         self.class_names = list(class_names or []) or parse_class_names(meta) or []
         self.conf_threshold = conf_threshold
@@ -227,31 +226,25 @@ class Detector:
 
         # Buffers reutilizados a cada quadro (sem alocação por inferência).
         self._canvas = np.empty((self.imgsz, self.imgsz, 3), np.uint8)
-        self._input = np.empty((1, 3, self.imgsz, self.imgsz), np.float32)
+        if self.backend.input_layout == "nchw":
+            self._input = np.empty((1, 3, self.imgsz, self.imgsz), np.float32)
+        else:
+            self._input = np.empty((1, self.imgsz, self.imgsz, 3), np.float32)
 
-        log_event(log, "model_loaded", path=str(model_path), input=inp.shape, output=self.output_shape,
-                  layout=self.layout, classes=len(self.class_names), end2end=meta.get("end2end"),
-                  threads=intra_op_num_threads)
+        log_event(log, "model_loaded", backend=self.backend.name, path=str(model_path),
+                  input=list(self._input.shape), output=self.output_shape, layout=self.layout,
+                  classes=len(self.class_names), end2end=meta.get("end2end"), threads=self.backend.threads)
 
     @staticmethod
     def _resolve_imgsz(shape: list[object], imgsz: int) -> int:
-        """Tamanho da entrada: o do ONNX (estático) ou o configurado (entrada dinâmica)."""
-        h, w = shape[2], shape[3]
-        if isinstance(h, int) and isinstance(w, int):
-            if h != w:
-                raise ModelError(f"entrada não quadrada: {shape}")
-            if imgsz and imgsz != h:
-                raise ModelError(f"model.imgsz={imgsz}, mas o ONNX foi exportado com {h}x{w}; "
-                                 "use 0 (automático) ou exporte de novo")
-            return h
-        if not imgsz:
-            raise ModelError(f"o ONNX tem entrada dinâmica {shape}; defina model.imgsz (ex.: 640)")
-        return imgsz
+        """Tamanho da entrada NCHW: o do modelo (estático) ou o configurado (entrada dinâmica)."""
+        return resolve_imgsz(shape[2], shape[3], imgsz)
 
     def describe(self) -> dict[str, object]:
         return {
-            "input": [self.input_name, [1, 3, self.imgsz, self.imgsz]],
-            "output": [self.output_name, list(self.output_shape)],
+            "backend": self.backend.name,
+            "input": [self.backend.input_name, list(self._input.shape)],
+            "output": [self.backend.output_name, list(self.output_shape)],
             "layout": self.layout,
             "classes": self.class_names,
             "end2end": self.metadata.get("end2end"),
@@ -260,8 +253,11 @@ class Detector:
 
     def preprocess(self, image_bgr: np.ndarray) -> tuple[float, int, int]:
         _, gain, pad_x, pad_y = letterbox(image_bgr, self.imgsz, out=self._canvas)
-        chw_rgb = self._canvas.transpose(2, 0, 1)[::-1]  # view: CHW e BGR->RGB
-        np.divide(chw_rgb, np.float32(255.0), out=self._input[0], dtype=np.float32)
+        if self.backend.input_layout == "nchw":
+            rgb = self._canvas.transpose(2, 0, 1)[::-1]  # view: CHW e BGR->RGB
+        else:
+            rgb = self._canvas[..., ::-1]  # view: HWC e BGR->RGB
+        np.divide(rgb, np.float32(255.0), out=self._input[0], dtype=np.float32)
         return gain, pad_x, pad_y
 
     def detect(self, image_bgr: np.ndarray) -> InferenceResult:
@@ -271,10 +267,12 @@ class Detector:
         t0 = time.perf_counter()
         gain, pad_x, pad_y = self.preprocess(image_bgr)
         t1 = time.perf_counter()
-        output = self.session.run([self.output_name], {self.input_name: self._input})[0]
+        output = self.backend.run(self._input)
         t2 = time.perf_counter()
         if self.layout is None:
             self.layout = detect_layout(output.shape, len(self.class_names) or None, self._end2end_hint)
+        if boxes_are_normalized(output, self.layout, self.backend.normalized_boxes):
+            output = denormalize_boxes(output, self.layout, self.imgsz)
         boxes, scores, class_ids = postprocess(output, self.layout, self.conf_threshold,
                                                self.iou_threshold, self.max_detections)
         boxes = scale_boxes(boxes, gain, pad_x, pad_y, h, w)

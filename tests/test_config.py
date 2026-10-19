@@ -34,7 +34,6 @@ def test_saved_with_mode_600(tmp_path):
 
 @pytest.mark.parametrize("patch, msg", [
     ({"model": {"conf_threshold": 1.5}}, "model.conf_threshold"),
-    ({"thermal": {"temp_high_c": 60, "temp_resume_c": 65}}, "temp_resume_c"),
     ({"ws_server": {"port": "8000"}}, "ws_server.port"),
     ({"camera": {"jpeg_quality": True}}, "camera.jpeg_quality"),
     ({"alerts": {"threshold": 0.1}}, "alerts.threshold"),
@@ -77,9 +76,21 @@ def test_old_config_is_migrated(tmp_path):
 @pytest.mark.parametrize("patch, msg", [
     ({"inference": {"capture_interval_s": 0.1}}, "capture_interval_s"),
     ({"inference": {"mode": "nuvem"}}, "inference.mode"),
+    ({"inference": {"mode": "auto"}, "model": {"imgsz": 7}}, "model.imgsz"),
     ({"model": {"imgsz": 100}}, "model.imgsz"),
     ({"model": {"class_names": "Percevejo"}}, "model.class_names"),
 ])
 def test_new_options_validated(tmp_path, patch, msg):
     with pytest.raises(ConfigError, match=msg.replace(".", r"\.")):
         cfgmod.from_dict(patch, tmp_path)
+
+
+def test_thermal_section_and_auto_mode_are_migrated(tmp_path):
+    """config.json com a seção "thermal" e modo "auto" (versão anterior) continua carregando."""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"node_id": "abc", "thermal": {"temp_high_c": 70},
+                                "inference": {"mode": "auto", "capture_interval_s": 5}}), encoding="utf-8")
+    cfg = cfgmod.load(path)
+    assert cfg.inference.mode == "local"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert "thermal" not in saved and saved["inference"]["mode"] == "local"

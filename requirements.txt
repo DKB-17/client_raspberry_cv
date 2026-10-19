@@ -6,7 +6,8 @@
 # Se o seu apt tiver outra versão, ajuste esta linha para a versão de:
 #   python3 -c "import numpy; print(numpy.__version__)"
 numpy==2.2.4
-onnxruntime==1.31.0
+onnxruntime==1.31.0        # runtime da tag PEST_MODEL_BACKEND=onnx (.onnx)
+ai-edge-litert==2.2.0      # runtime da tag PEST_MODEL_BACKEND=litert (.tflite do Ultralytics)
 opencv-python-headless==4.12.0.88
 websockets==15.0.1
 

@@ -5,3 +5,4 @@ config.json
 data/
 logs/
 qr_servidor.png
+.env

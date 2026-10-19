@@ -26,7 +26,7 @@ from pest_node.protocol import new_packet_id, pack_frame
 URL = os.environ.get("REAL_SERVER_URL", "")
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE_ID = "48651cd1-32b5-42a3-8dbd-93aafee47985"
-SAMPLE = ROOT.parent / "servidor_cv" / "data" / "2026-09-14" / "classified" / f"{SAMPLE_ID}.jpg"
+SAMPLE = ROOT / "tests" / "fixtures" / "sample_pest.jpg"  # Gafanhoto (dataset AgroInsect)
 
 pytestmark = [pytest.mark.real_server, pytest.mark.skipif(not URL, reason="REAL_SERVER_URL não definido")]
 

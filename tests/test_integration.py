@@ -19,8 +19,7 @@ from tools.mock_server import MockServer
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = ROOT / "models" / "teste2.onnx"
-SAMPLE = ROOT.parent / "servidor_cv" / "data" / "2026-09-14" / "classified" / \
-    "48651cd1-32b5-42a3-8dbd-93aafee47985.jpg"
+SAMPLE = ROOT / "tests" / "fixtures" / "sample_pest.jpg"  # Gafanhoto (dataset AgroInsect)
 
 pytestmark = pytest.mark.skipif(not (MODEL.exists() and SAMPLE.exists()), reason="modelo/amostra ausentes")
 
@@ -30,8 +29,6 @@ def make_cfg(tmp_path, server_url=""):
     cfg.model.path = str(MODEL)
     cfg.server_ws_url = server_url
     cfg.inference.capture_interval_s = 0.5
-    cfg.thermal.poll_interval_s = 1
-    cfg.thermal.max_interval_s = 4
     cfg.alerts.cooldown_s = 3600
     cfg.ws_server.port = 0
     cfg.ws_server.host = "127.0.0.1"
@@ -75,19 +72,6 @@ async def test_camera_detection_raises_alert_delivered_to_server(tmp_path):
     assert len(alert) == 1  # cooldown impede alertas repetidos da mesma praga
     assert alert[0].image_shape == pest.shape  # imagem enviada no tamanho capturado
     assert node.frames >= 2
-
-
-async def test_heat_triggers_offload_to_server_as_stream(tmp_path):
-    blank = np.full((480, 640, 3), 90, np.uint8)
-    async with MockServer(detections=lambda _id: []) as srv:
-        task, holder = start(make_cfg(tmp_path, srv.url), ArrayCamera([blank]), SimulatedSensor([(80.0, 0)]))
-        node = await started(holder)
-        await wait_until(lambda: node.offloaded >= 1)
-        node.stop_event.set()
-        await task
-    assert node.controller.degraded
-    assert any(p.is_stream for p in srv.received)
-    assert not any(not p.is_stream for p in srv.received)  # quadro sem praga não é persistido
 
 
 def qr_frame(text):
@@ -139,10 +123,10 @@ async def test_mode_server_sends_every_frame_for_analysis(tmp_path):
         node.stop_event.set()
         await task
     assert all(p.is_stream for p in srv.received)
-    assert not node.controller.degraded  # foi para o servidor por configuração, não por calor
 
 
 async def test_mode_local_never_sends_frames_even_when_hot(tmp_path):
+    """Sem ajuste por temperatura: mesmo a 80 °C o intervalo e o modo não mudam."""
     blank = np.full((480, 640, 3), 90, np.uint8)
     async with MockServer() as srv:
         cfg = make_cfg(tmp_path, srv.url)
@@ -153,6 +137,7 @@ async def test_mode_local_never_sends_frames_even_when_hot(tmp_path):
         node.stop_event.set()
         await task
     assert node.offloaded == 0 and srv.received == []
+    assert node.interval_s == cfg.inference.capture_interval_s
 
 
 async def test_app_photo_with_pest_is_answered_and_forwarded(tmp_path):
@@ -169,6 +154,6 @@ async def test_app_photo_with_pest_is_answered_and_forwarded(tmp_path):
         node.stop_event.set()
         await task
     assert first["status"] == "analisando" and second["status"] == "processado"
-    assert second["detections"][0]["class_name"] == "Percevejo-verde-ninfa"
+    assert second["detections"][0]["class_name"] == "Gafanhoto"
     assert len([p for p in srv.received if not p.is_stream]) == 1
 

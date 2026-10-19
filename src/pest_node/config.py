@@ -1,8 +1,12 @@
 """Carga, validação e persistência do config.json.
 
 Todas as opções do nó vivem em um único arquivo JSON. Valores inválidos geram
-ConfigError com o caminho da chave (ex.: "thermal.temp_high_c"), nunca um
+ConfigError com o caminho da chave (ex.: "model.conf_threshold"), nunca um
 comportamento silencioso.
+
+O modelo carregado é escolhido pelo .env ao lado do config.json (ver
+.env.example): PEST_MODEL_BACKEND (onnx | litert) e PEST_MODEL_NAME (arquivo
+dentro de models/). Precedência: ambiente > .env > config.json > padrão.
 """
 
 from __future__ import annotations
@@ -13,11 +17,21 @@ import stat
 import tempfile
 import uuid
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
-from pathlib import Path
+from collections.abc import Mapping
+from pathlib import Path, PurePosixPath
 from typing import Any
+
+from .envfile import read_env_file
 
 DEFAULT_CONFIG_PATH = Path("config.json")
 CONFIG_ENV_VAR = "PEST_NODE_CONFIG"
+
+ENV_FILE_NAME = ".env"
+ENV_MODEL_BACKEND = "PEST_MODEL_BACKEND"  # tag do runtime: "onnx" ou "litert"
+ENV_MODEL_NAME = "PEST_MODEL_NAME"  # nome do arquivo dentro de MODELS_DIR
+MODELS_DIR = "models"
+# Tag do .env -> extensão do arquivo do modelo.
+MODEL_BACKENDS = {"onnx": ".onnx", "litert": ".tflite"}
 
 
 class ConfigError(ValueError):
@@ -26,12 +40,13 @@ class ConfigError(ValueError):
 
 @dataclass
 class ModelConfig:
+    backend: str = "onnx"  # "onnx" (ONNX Runtime) ou "litert" (LiteRT/.tflite); o .env tem prioridade
     path: str = "models/teste2.onnx"
     conf_threshold: float = 0.25  # mesmo padrão do servidor (YOLO_CONFIDENCE_THRESHOLD)
     iou_threshold: float = 0.7  # padrão do Ultralytics predict, usado pelo servidor
     max_detections: int = 300
-    intra_op_num_threads: int = 2
-    inter_op_num_threads: int = 1
+    intra_op_num_threads: int = 2  # no LiteRT vira o num_threads do interpreter
+    inter_op_num_threads: int = 1  # só ONNX
     imgsz: int = 0  # 0 = lê do próprio ONNX; obrigatório só para modelos com entrada dinâmica
     class_names: list[str] = field(default_factory=list)  # vazio = nomes dos metadados do ONNX
 
@@ -45,7 +60,7 @@ class CameraConfig:
     fake_images_dir: str = ""  # se preenchido, usa a câmera falsa (pasta de imagens)
 
 
-PROCESSING_MODES = ("auto", "local", "server")
+PROCESSING_MODES = ("local", "server")
 
 
 @dataclass
@@ -54,22 +69,10 @@ class InferenceConfig:
     # Vem do QR Code do servidor (CAPTURE_INTERVAL_S); pode ser ajustado aqui.
     capture_interval_s: float = 5.0
     # Onde o YOLO roda:
-    #   "auto"   no Pi; quando aquecido/estrangulado, envia o quadro ao servidor
-    #   "local"  sempre no Pi
-    #   "server" sempre no servidor (quadro STREAM_); se o servidor cair, roda no Pi
-    mode: str = "auto"
+    #   "local"  no próprio Pi
+    #   "server" no servidor (quadro STREAM_); se o servidor cair, roda no Pi
+    mode: str = "local"
     server_timeout_s: float = 15.0  # espera pela resposta do servidor ao enviar um quadro
-
-
-@dataclass
-class ThermalConfig:
-    poll_interval_s: float = 5.0
-    temp_high_c: float = 70.0
-    temp_resume_c: float = 65.0
-    react_to_throttling: bool = True
-    react_to_under_voltage: bool = True
-    slowdown_factor: float = 2.0
-    max_interval_s: float = 30.0
 
 
 @dataclass
@@ -118,7 +121,6 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
-    thermal: ThermalConfig = field(default_factory=ThermalConfig)
     alerts: AlertConfig = field(default_factory=AlertConfig)
     outbox: OutboxConfig = field(default_factory=OutboxConfig)
     ws_server: WsServerConfig = field(default_factory=WsServerConfig)
@@ -126,6 +128,8 @@ class Config:
 
     # Diretório do config.json; caminhos relativos são resolvidos a partir dele.
     base_dir: Path = field(default=Path("."), repr=False, compare=False)
+    # Valores de "model" do config.json trocados pelo .env; o save() grava os originais.
+    env_origin: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     def resolve(self, path: str) -> Path:
         p = Path(path).expanduser()
@@ -133,8 +137,12 @@ class Config:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
-        data.pop("base_dir", None)
+        for name in _INTERNAL_FIELDS:
+            data.pop(name, None)
         return data
+
+
+_INTERNAL_FIELDS = ("base_dir", "env_origin")
 
 
 # --------------------------------------------------------------------------- #
@@ -170,7 +178,7 @@ _TYPES = {"bool": bool, "int": int, "float": float, "str": str, "list[str]": lis
 def _build(cls: type, data: dict[str, Any], prefix: str) -> Any:
     if not isinstance(data, dict):
         raise ConfigError(f"{prefix or 'raiz'}: esperado objeto JSON")
-    known = {f.name: f for f in fields(cls) if f.name != "base_dir"}
+    known = {f.name: f for f in fields(cls) if f.name not in _INTERNAL_FIELDS}
     unknown = set(data) - set(known)
     if unknown:
         raise ConfigError(f"{prefix or 'raiz'}: chave(s) desconhecida(s): {', '.join(sorted(unknown))}")
@@ -194,8 +202,15 @@ def _require(cond: bool, msg: str) -> None:
 
 def validate(cfg: Config) -> None:
     """Regras de faixa e coerência entre campos."""
-    m, c, i, t, a, o, w, lg = (cfg.model, cfg.camera, cfg.inference, cfg.thermal,
-                              cfg.alerts, cfg.outbox, cfg.ws_server, cfg.logging)
+    m, c, i, a, o, w, lg = (cfg.model, cfg.camera, cfg.inference, cfg.alerts, cfg.outbox,
+                            cfg.ws_server, cfg.logging)
+    _require(m.backend in MODEL_BACKENDS,
+             f"model.backend deve ser um de: {', '.join(MODEL_BACKENDS)} "
+             f"(tag {ENV_MODEL_BACKEND} no .env), recebido {m.backend!r}")
+    ext = MODEL_BACKENDS[m.backend]
+    _require(Path(m.path).suffix.lower() == ext,
+             f"model.backend={m.backend} exige arquivo {ext}, recebido {Path(m.path).name!r} "
+             f"(confira {ENV_MODEL_BACKEND} e {ENV_MODEL_NAME} no .env)")
     _require(0.0 < m.conf_threshold < 1.0, "model.conf_threshold deve estar entre 0 e 1")
     _require(0.0 < m.iou_threshold < 1.0, "model.iou_threshold deve estar entre 0 e 1")
     _require(1 <= m.max_detections <= 1000, "model.max_detections deve estar entre 1 e 1000")
@@ -210,12 +225,6 @@ def validate(cfg: Config) -> None:
     _require(i.server_timeout_s > 0, "inference.server_timeout_s deve ser > 0")
     _require(m.imgsz == 0 or (32 <= m.imgsz <= 2048 and m.imgsz % 32 == 0),
              "model.imgsz deve ser 0 (automático) ou múltiplo de 32 entre 32 e 2048")
-    _require(t.poll_interval_s >= 1, "thermal.poll_interval_s deve ser >= 1")
-    _require(30 <= t.temp_high_c <= 85, "thermal.temp_high_c deve estar entre 30 e 85 °C")
-    _require(t.temp_resume_c < t.temp_high_c,
-             "thermal.temp_resume_c deve ser menor que thermal.temp_high_c (histerese)")
-    _require(t.slowdown_factor > 1.0, "thermal.slowdown_factor deve ser > 1")
-    _require(t.max_interval_s >= 1.0, "thermal.max_interval_s deve ser >= 1")
     _require(0.0 < a.threshold <= 1.0, "alerts.threshold deve estar entre 0 e 1")
     _require(a.threshold >= m.conf_threshold,
              "alerts.threshold não pode ser menor que model.conf_threshold")
@@ -256,10 +265,13 @@ def default_path() -> Path:
 
 def _migrate(data: dict[str, Any]) -> bool:
     """Converte chaves de versões anteriores do config.json. Retorna True se mudou algo."""
+    changed = data.pop("thermal", None) is not None  # o ajuste por temperatura foi removido
     inf = data.get("inference")
     if not isinstance(inf, dict):
-        return False
-    changed = False
+        return changed
+    if inf.get("mode") == "auto":
+        inf["mode"] = "local"
+        changed = True
     if "target_fps" in inf:
         fps = inf.pop("target_fps")
         if "capture_interval_s" not in inf and isinstance(fps, (int, float)) and fps > 0:
@@ -267,7 +279,7 @@ def _migrate(data: dict[str, Any]) -> bool:
         changed = True
     if "offload_when_degraded" in inf:
         offload = inf.pop("offload_when_degraded")
-        inf.setdefault("mode", "auto" if offload else "local")
+        inf.setdefault("mode", "local")
         changed = True
     if "offload_timeout_s" in inf:
         inf.setdefault("server_timeout_s", inf.pop("offload_timeout_s"))
@@ -275,11 +287,31 @@ def _migrate(data: dict[str, Any]) -> bool:
     return changed
 
 
-def from_dict(data: dict[str, Any], base_dir: Path = Path(".")) -> Config:
+def load_env(base_dir: Path) -> dict[str, str]:
+    """Variáveis do .env da pasta do config.json, com o ambiente do processo por cima."""
+    return {**read_env_file(Path(base_dir) / ENV_FILE_NAME), **os.environ}
+
+
+def apply_env(cfg: Config, env: Mapping[str, str]) -> None:
+    """Aplica PEST_MODEL_BACKEND / PEST_MODEL_NAME sobre a seção "model"."""
+    m = cfg.model
+    backend = env.get(ENV_MODEL_BACKEND, "").strip().lower()
+    if backend:
+        cfg.env_origin.setdefault("backend", m.backend)
+        m.backend = backend
+    name = env.get(ENV_MODEL_NAME, "").strip()
+    if name:
+        cfg.env_origin.setdefault("path", m.path)
+        m.path = name if Path(name).is_absolute() else str(PurePosixPath(MODELS_DIR) / Path(name).as_posix())
+
+
+def from_dict(data: dict[str, Any], base_dir: Path = Path("."), env: Mapping[str, str] | None = None) -> Config:
     data = json.loads(json.dumps(data))  # cópia profunda
     _migrate(data)
     cfg = _build(Config, data, "")
     cfg.base_dir = base_dir
+    if env is not None:
+        apply_env(cfg, env)
     validate(cfg)
     return cfg
 
@@ -290,10 +322,12 @@ def load(path: Path | None = None, create: bool = True) -> Config:
     Sempre garante um node_id persistente.
     """
     path = Path(path or default_path()).expanduser().resolve()
+    env = load_env(path.parent)
     if not path.exists():
         if not create:
             raise ConfigError(f"arquivo de configuração não encontrado: {path}")
         cfg = Config(base_dir=path.parent)
+        apply_env(cfg, env)
     else:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -301,7 +335,7 @@ def load(path: Path | None = None, create: bool = True) -> Config:
             raise ConfigError(f"{path}: JSON inválido (linha {exc.lineno}, coluna {exc.colno})") from exc
         except OSError as exc:
             raise ConfigError(f"{path}: não foi possível ler ({exc})") from exc
-        cfg = from_dict(data, base_dir=path.parent)
+        cfg = from_dict(data, base_dir=path.parent, env=env)
         if _migrate(data):  # grava já no formato novo
             save(cfg, path)
     if not cfg.node_id or not path.exists():
@@ -315,7 +349,9 @@ def save(cfg: Config, path: Path | None = None) -> Path:
     """Grava de forma atômica e com permissão 600 (pode conter dados sensíveis)."""
     path = Path(path or (cfg.base_dir / DEFAULT_CONFIG_PATH.name)).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(cfg.to_dict(), indent=2, ensure_ascii=False) + "\n"
+    data = cfg.to_dict()
+    data["model"].update(cfg.env_origin)  # o que veio do .env fica só no .env
+    payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
     fd, tmp = tempfile.mkstemp(prefix=".config-", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:

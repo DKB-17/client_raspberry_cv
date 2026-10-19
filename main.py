@@ -2,9 +2,10 @@
 
 Fluxo de execução (python main.py):
 
-  1. Configuração  carrega config.json (modelo, câmera, intervalo, limiares...).
-  2. Serviços      carrega o modelo YOLO (ONNX) e sobe a fila de alertas, o
-                   WebSocket do app e a leitura de temperatura.
+  1. Configuração  carrega config.json (câmera, intervalo, limiares...) e o .env
+                   (PEST_MODEL_BACKEND=onnx|litert e PEST_MODEL_NAME, ver .env.example).
+  2. Serviços      carrega o modelo YOLO (ONNX ou LiteRT) e sobe a fila de alertas e o
+                   WebSocket do app.
   3. Câmera        abre o módulo de câmera (tenta de novo se falhar).
   4. Servidor      se não houver servidor configurado (ou com --scan-qr), lê o
                    QR Code do servidor: ele traz a URL e o intervalo de captura.
@@ -60,7 +61,7 @@ def iniciar_logs(cfg: Config) -> None:
     lg = cfg.logging
     setup_logging(lg.level, cfg.resolve(lg.dir), lg.max_bytes, lg.backup_count)
     m, i = cfg.model, cfg.inference
-    log_event(log, "config_loaded", version=__version__, node_id=cfg.node_id, model=m.path,
+    log_event(log, "config_loaded", version=__version__, node_id=cfg.node_id, backend=m.backend, model=m.path,
               conf=m.conf_threshold, iou=m.iou_threshold, threads=m.intra_op_num_threads,
               capture_interval_s=i.capture_interval_s, mode=i.mode, alert_threshold=cfg.alerts.threshold,
               server=cfg.server_ws_url or None)
@@ -84,7 +85,7 @@ async def descobrir_servidor(node: Node, timeout_s: float = QR_TIMEOUT_S) -> Non
 
 
 async def fluxo_de_coleta(node: Node) -> None:
-    """Captura e analisa um quadro a cada capture_interval_s (ampliado se o Pi esquentar)."""
+    """Captura e analisa um quadro a cada capture_interval_s segundos."""
     while not node.stop_event.is_set():
         inicio = time.monotonic()
         try:
@@ -143,11 +144,17 @@ def gravar_servidor(cfg: Config, texto: str) -> int:
     return 0
 
 
+def _default_config() -> Path:
+    """config.json ao lado do main.py (ou $PEST_NODE_CONFIG), não importa de onde se rode."""
+    env = os.environ.get(cfgmod.CONFIG_ENV_VAR)
+    return Path(env) if env else Path(__file__).resolve().parent / "config.json"
+
+
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Nó sensor de detecção de pragas",
                                 epilog="Sem opções: inicia o fluxo de coleta.")
     p.add_argument("--config", type=Path, default=None,
-                   help=f"config.json (padrão: ${cfgmod.CONFIG_ENV_VAR} ou ./config.json)")
+                   help="config.json (padrão: config.json ao lado do main.py)")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--scan-qr", action="store_true", help="força nova leitura do QR na inicialização")
     g.add_argument("--set-server", metavar="URL", help="grava o servidor (ex.: ws://IP:8000/ws?capture_interval=5)")
@@ -161,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     args = parse_args(argv)
-    path = (args.config or cfgmod.default_path()).expanduser().resolve()
+    path = (args.config or _default_config()).expanduser().resolve()
     try:
         cfg = carregar_configuracao(path)
     except ConfigError as exc:
