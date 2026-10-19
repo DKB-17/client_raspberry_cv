@@ -1,0 +1,30 @@
+# Unidade systemd do nó sensor. O install.sh troca @USER@ e @DIR@ e copia para
+# /etc/systemd/system/pest-node.service.
+[Unit]
+Description=No sensor de deteccao de pragas (pest-node)
+# Não espera a rede: o nó funciona offline e reconecta sozinho.
+After=network.target
+# Reinicia sempre, sem limite de tentativas.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+SupplementaryGroups=video render
+WorkingDirectory=@DIR@
+Environment=PYTHONPATH=@DIR@/src
+Environment=PYTHONUNBUFFERED=1
+Environment=PEST_NODE_CONFIG=@DIR@/config.json
+ExecStart=@DIR@/.venv/bin/python -m pest_node run
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+# Proteção contra estouro de RAM (Pi 3 tem ~905 MiB): o kernel recicla o
+# serviço antes de travar o sistema; o systemd o reinicia.
+MemoryHigh=550M
+MemoryMax=700M
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

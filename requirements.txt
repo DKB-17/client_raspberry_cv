@@ -1,0 +1,15 @@
+# Dependências Python do nó sensor (Raspberry Pi 3, Debian 13 trixie, Python 3.13, arm64).
+# Instale DENTRO do venv criado com --system-site-packages (ver README).
+#
+# numpy é fixado na MESMA versão do pacote apt python3-numpy (2.2.4 no trixie),
+# porque o Picamera2 (instalado pelo apt) é compilado contra ele.
+# Se o seu apt tiver outra versão, ajuste esta linha para a versão de:
+#   python3 -c "import numpy; print(numpy.__version__)"
+numpy==2.2.4
+onnxruntime==1.31.0
+opencv-python-headless==4.12.0.88
+websockets==15.0.1
+
+# Opcional, apenas para rodar os testes no Pi:
+# pytest==8.4.2
+# pytest-asyncio==1.2.0

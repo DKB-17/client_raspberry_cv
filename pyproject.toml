@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pest-node"
+version = "0.1.0"
+description = "Nó sensor de borda (Raspberry Pi) para detecção de pragas com YOLO26n/ONNX"
+requires-python = ">=3.11"
+# As dependências ficam fixadas em requirements.txt (instaladas manualmente),
+# para que o pip não substitua o numpy do apt usado pelo Picamera2.
+dependencies = []
+
+[project.scripts]
+pest-node = "pest_node.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "real_server: testes que sobem o servidor_cv real (pulados se as dependências dele faltarem)",
+]

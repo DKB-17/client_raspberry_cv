@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Atalho para a CLI usando o venv do projeto:  scripts/pest-node selftest
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="$DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+export PEST_NODE_CONFIG="${PEST_NODE_CONFIG:-$DIR/config.json}"
+exec "$DIR/.venv/bin/python" -m pest_node "$@"

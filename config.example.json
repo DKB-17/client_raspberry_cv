@@ -1,0 +1,64 @@
+{
+  "server_ws_url": "",
+  "node_id": "",
+  "model": {
+    "path": "models/teste2.onnx",
+    "conf_threshold": 0.25,
+    "iou_threshold": 0.7,
+    "max_detections": 300,
+    "intra_op_num_threads": 2,
+    "inter_op_num_threads": 1
+  },
+  "camera": {
+    "width": 1296,
+    "height": 972,
+    "max_fps": 10.0,
+    "jpeg_quality": 85,
+    "fake_images_dir": ""
+  },
+  "inference": {
+    "target_fps": 0.5,
+    "offload_when_degraded": true,
+    "offload_timeout_s": 15.0
+  },
+  "thermal": {
+    "poll_interval_s": 5.0,
+    "temp_high_c": 70.0,
+    "temp_resume_c": 65.0,
+    "react_to_throttling": true,
+    "react_to_under_voltage": true,
+    "slowdown_factor": 2.0,
+    "max_interval_s": 30.0
+  },
+  "alerts": {
+    "threshold": 0.6,
+    "cooldown_s": 60.0,
+    "classes": []
+  },
+  "outbox": {
+    "db_path": "data/outbox.sqlite",
+    "max_items": 200,
+    "max_bytes": 104857600,
+    "max_attempts": 5,
+    "backoff_initial_s": 2.0,
+    "backoff_max_s": 300.0,
+    "response_timeout_s": 60.0
+  },
+  "ws_server": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 8000,
+    "path": "/ws",
+    "max_frame_bytes": 5242880,
+    "max_id_bytes": 256,
+    "max_pending_photos": 4,
+    "forward_alerts": true
+  },
+  "logging": {
+    "level": "INFO",
+    "dir": "logs",
+    "max_bytes": 2097152,
+    "backup_count": 3,
+    "metrics_interval_s": 30.0
+  }
+}
