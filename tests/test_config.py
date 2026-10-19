@@ -60,3 +60,26 @@ def test_example_config_is_valid():
     example = Path(__file__).resolve().parents[1] / "config.example.json"
     data = json.loads(example.read_text(encoding="utf-8"))
     cfgmod.from_dict(data, example.parent)
+
+
+def test_old_config_is_migrated(tmp_path):
+    """config.json da versão anterior (target_fps/offload_when_degraded) continua funcionando."""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"node_id": "abc", "inference": {
+        "target_fps": 0.5, "offload_when_degraded": False, "offload_timeout_s": 9.0}}), encoding="utf-8")
+    cfg = cfgmod.load(path)
+    assert cfg.inference.capture_interval_s == 2.0
+    assert cfg.inference.mode == "local" and cfg.inference.server_timeout_s == 9.0
+    saved = json.loads(path.read_text(encoding="utf-8"))["inference"]
+    assert "target_fps" not in saved and saved["capture_interval_s"] == 2.0
+
+
+@pytest.mark.parametrize("patch, msg", [
+    ({"inference": {"capture_interval_s": 0.1}}, "capture_interval_s"),
+    ({"inference": {"mode": "nuvem"}}, "inference.mode"),
+    ({"model": {"imgsz": 100}}, "model.imgsz"),
+    ({"model": {"class_names": "Percevejo"}}, "model.class_names"),
+])
+def test_new_options_validated(tmp_path, patch, msg):
+    with pytest.raises(ConfigError, match=msg.replace(".", r"\.")):
+        cfgmod.from_dict(patch, tmp_path)

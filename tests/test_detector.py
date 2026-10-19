@@ -172,3 +172,18 @@ def test_matches_server_saved_results(detector, jpg, js):
     for g, e in zip(got, expected):
         assert g["confidence"] == pytest.approx(e["confidence"], abs=0.01)
         np.testing.assert_allclose(g["bbox"], e["bbox"], atol=2.0)
+
+
+@needs_model
+def test_model_options_imgsz_and_class_names():
+    names = [f"c{i}" for i in range(12)]
+    det = Detector(MODEL, class_names=names, imgsz=640)
+    assert det.class_names == names
+    with pytest.raises(ModelError, match="imgsz"):
+        Detector(MODEL, imgsz=320)
+
+
+def test_resolve_imgsz_dynamic_input():
+    assert Detector._resolve_imgsz([1, 3, "h", "w"], 416) == 416
+    with pytest.raises(ModelError, match="dinâmica"):
+        Detector._resolve_imgsz([1, 3, "h", "w"], 0)

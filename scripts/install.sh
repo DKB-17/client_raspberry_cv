@@ -87,7 +87,7 @@ REQ_NUMPY="$(sed -n 's/^numpy==//p' "$DIR/requirements.txt")"
   warn "numpy do apt é $SYS_NUMPY, requirements.txt fixa $REQ_NUMPY: ajuste a linha numpy== para $SYS_NUMPY"
 
 # ----------------------------------------------------------------- config e pastas
-mkdir -p "$DIR/data" "$DIR/logs" "$DIR/bench"
+mkdir -p "$DIR/data" "$DIR/logs"
 if [[ ! -f "$DIR/config.json" ]]; then
   cp "$DIR/config.example.json" "$DIR/config.json"
   info "config.json criado a partir de config.example.json"
@@ -96,7 +96,7 @@ chmod 600 "$DIR/config.json"
 chmod +x "$DIR/scripts/pest-node"
 [[ -f "$DIR/models/teste2.onnx" ]] || warn "modelo ausente: copie o .onnx para $DIR/models/"
 if [[ "$(id -u)" -eq 0 && "$RUN_USER" != "root" ]]; then
-  chown -R "$RUN_USER":"$RUN_USER" "$DIR/data" "$DIR/logs" "$DIR/bench" "$DIR/config.json" "$DIR/.venv"
+  chown -R "$RUN_USER":"$RUN_USER" "$DIR/data" "$DIR/logs" "$DIR/config.json" "$DIR/.venv"
 fi
 
 # ----------------------------------------------------------------- systemd
@@ -116,4 +116,4 @@ else
 fi
 
 echo
-info "Próximos passos: scripts/pest-node scan-qr  e  scripts/pest-node selftest"
+info "Próximos passos: scripts/pest-node --scan-qr  e  scripts/pest-node --selftest"

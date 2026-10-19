@@ -23,7 +23,7 @@ def test_flags_of_real_pi():
 
 
 def _ctrl(**kw):
-    defaults = dict(target_fps=1.0, temp_high_c=70, temp_resume_c=65, slowdown_factor=2, max_interval_s=8)
+    defaults = dict(base_interval_s=1.0, temp_high_c=70, temp_resume_c=65, slowdown_factor=2, max_interval_s=8)
     defaults.update(kw)
     return AdaptiveController(**defaults)
 
@@ -66,3 +66,17 @@ def test_degraded_flag():
     ctrl = _ctrl()
     run(ctrl, [(75, 0)])
     assert ctrl.degraded and "temp" in ctrl.reason
+
+
+def test_capture_interval_above_max_still_flags_degraded():
+    ctrl = _ctrl(base_interval_s=10, max_interval_s=8)
+    assert run(ctrl, [(75, 0)]) == [10]  # já está no teto, mas está sob pressão
+    assert ctrl.degraded
+    assert run(ctrl, [(50, 0)]) == [10] and not ctrl.degraded
+
+
+def test_set_base_interval_keeps_thermal_factor():
+    ctrl = _ctrl(base_interval_s=1, max_interval_s=60)
+    run(ctrl, [(75, 0)])  # 2 s
+    ctrl.set_base_interval(5)
+    assert ctrl.interval_s == 10 and ctrl.base_interval_s == 5

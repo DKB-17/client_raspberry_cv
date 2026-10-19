@@ -16,7 +16,7 @@ from __future__ import annotations
 import ast
 import time
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import cv2
 import numpy as np
@@ -24,6 +24,9 @@ import onnxruntime as ort
 
 from .logging_setup import get_logger, log_event
 from .models import Detection, InferenceResult
+
+if TYPE_CHECKING:
+    from .config import Config
 
 log = get_logger("detector")
 
@@ -175,9 +178,16 @@ def parse_class_names(meta: dict[str, str]) -> list[str] | None:
 #  Detector
 # --------------------------------------------------------------------------- #
 class Detector:
+    @classmethod
+    def from_config(cls, cfg: Config) -> Detector:
+        """Cria o detector a partir da seção "model" do config.json."""
+        m = cfg.model
+        return cls(cfg.resolve(m.path), m.conf_threshold, m.iou_threshold, m.max_detections,
+                   m.intra_op_num_threads, m.inter_op_num_threads, m.class_names, m.imgsz)
+
     def __init__(self, model_path: Path, conf_threshold: float = 0.25, iou_threshold: float = 0.7,
                  max_detections: int = 300, intra_op_num_threads: int = 2, inter_op_num_threads: int = 1,
-                 class_names: list[str] | None = None) -> None:
+                 class_names: list[str] | None = None, imgsz: int = 0) -> None:
         if not Path(model_path).is_file():
             raise ModelError(f"modelo não encontrado: {model_path}")
         opts = ort.SessionOptions()
@@ -194,20 +204,18 @@ class Detector:
 
         inp = self.session.get_inputs()[0]
         self.input_name = inp.name
-        if len(inp.shape) != 4 or not all(isinstance(d, int) for d in inp.shape[2:]):
+        if len(inp.shape) != 4:
             raise ModelError(f"entrada com forma não suportada: {inp.shape}")
-        if inp.shape[2] != inp.shape[3]:
-            raise ModelError(f"entrada não quadrada: {inp.shape}")
         if inp.type != "tensor(float)":
             raise ModelError(f"entrada deve ser float32, é {inp.type}")
-        self.imgsz = int(inp.shape[2])
+        self.imgsz = self._resolve_imgsz(inp.shape, imgsz)
         out = self.session.get_outputs()[0]
         self.output_name = out.name
         self.output_shape = tuple(out.shape)
 
         meta = self.session.get_modelmeta().custom_metadata_map
         self.metadata = dict(meta)
-        self.class_names = class_names or parse_class_names(meta) or []
+        self.class_names = list(class_names or []) or parse_class_names(meta) or []
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         self.max_detections = max_detections
@@ -224,6 +232,21 @@ class Detector:
         log_event(log, "model_loaded", path=str(model_path), input=inp.shape, output=self.output_shape,
                   layout=self.layout, classes=len(self.class_names), end2end=meta.get("end2end"),
                   threads=intra_op_num_threads)
+
+    @staticmethod
+    def _resolve_imgsz(shape: list[object], imgsz: int) -> int:
+        """Tamanho da entrada: o do ONNX (estático) ou o configurado (entrada dinâmica)."""
+        h, w = shape[2], shape[3]
+        if isinstance(h, int) and isinstance(w, int):
+            if h != w:
+                raise ModelError(f"entrada não quadrada: {shape}")
+            if imgsz and imgsz != h:
+                raise ModelError(f"model.imgsz={imgsz}, mas o ONNX foi exportado com {h}x{w}; "
+                                 "use 0 (automático) ou exporte de novo")
+            return h
+        if not imgsz:
+            raise ModelError(f"o ONNX tem entrada dinâmica {shape}; defina model.imgsz (ex.: 640)")
+        return imgsz
 
     def describe(self) -> dict[str, object]:
         return {

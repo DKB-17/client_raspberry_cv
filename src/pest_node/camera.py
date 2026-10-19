@@ -25,6 +25,7 @@ from .logging_setup import get_logger, log_event
 log = get_logger("camera")
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp"}
+CAMERA_WARMUP_S = 1.5  # tempo para a exposição/ganho automáticos estabilizarem
 
 
 class CameraError(RuntimeError):
@@ -72,8 +73,23 @@ class PiCamera:
         cam.start()
         self._cam, self._mapped_array = cam, MappedArray
         self._buf = np.empty((self.height, self.width, 3), np.uint8)
+        discarded = self._warm_up(cam)
         log_event(log, "camera_started", kind="picamera2", size=f"{self.width}x{self.height}",
-                  max_fps=self.max_fps, sensor=cam.camera_properties.get("Model"))
+                  max_fps=self.max_fps, sensor=cam.camera_properties.get("Model"), warmup_frames=discarded)
+
+    @staticmethod
+    def _warm_up(cam: object) -> int:
+        """Descarta os primeiros quadros enquanto a exposição automática converge.
+
+        Logo após start() a ov5647 entrega quadros escuros (brilho médio ~7 no Pi
+        do projeto); sem isso o primeiro quadro analisado sai quase preto.
+        """
+        deadline = time.monotonic() + CAMERA_WARMUP_S
+        count = 0
+        while time.monotonic() < deadline:
+            cam.capture_request().release()  # type: ignore[attr-defined]
+            count += 1
+        return count
 
     def capture(self) -> np.ndarray:
         if self._cam is None or self._buf is None:

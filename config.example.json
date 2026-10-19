@@ -7,7 +7,9 @@
     "iou_threshold": 0.7,
     "max_detections": 300,
     "intra_op_num_threads": 2,
-    "inter_op_num_threads": 1
+    "inter_op_num_threads": 1,
+    "imgsz": 0,
+    "class_names": []
   },
   "camera": {
     "width": 1296,
@@ -17,9 +19,9 @@
     "fake_images_dir": ""
   },
   "inference": {
-    "target_fps": 0.5,
-    "offload_when_degraded": true,
-    "offload_timeout_s": 15.0
+    "capture_interval_s": 5.0,
+    "mode": "auto",
+    "server_timeout_s": 15.0
   },
   "thermal": {
     "poll_interval_s": 5.0,

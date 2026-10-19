@@ -33,8 +33,17 @@ PostgreSQL. Por isso, quando uma detecção passa de `alerts.threshold`, o nó *
 Quadros sem praga **nunca saem do Pi**. Essa é uma adaptação consciente do requisito "enviar só resultados", decidida
 com o autor, já que o contrato real só aceita imagens.
 
-**Descarga de carga (offload).** Quando o Pi está aquecido ou estrangulado e o servidor está acessível, o nó envia o
-quadro como `STREAM_xxxxxxxx`: o servidor infere sem gravar, e o nó usa as detecções que voltam.
+**Intervalo de captura.** O servidor define de quantos em quantos segundos o nó captura um quadro para análise
+(`CAPTURE_INTERVAL_S` em `servidor_cv/src/core/config.py`, padrão 5 s) e envia esse valor no QR Code. O nó grava em
+`inference.capture_interval_s`. Se o Pi esquentar, o intervalo é ampliado temporariamente (seção 6).
+
+**Onde o YOLO roda** (`inference.mode`):
+- `auto` (padrão): no Pi; quando ele está aquecido ou estrangulado e o servidor está acessível, o quadro vai ao servidor;
+- `local`: sempre no Pi;
+- `server`: todo quadro vai ao servidor; se o servidor cair, roda no Pi.
+
+O quadro enviado para análise vai como `STREAM_xxxxxxxx`: o servidor infere sem gravar, e o nó usa as detecções que
+voltam.
 
 **Classes:** são 12, lidas dos metadados do próprio ONNX (não ficam fixas no código): Lagarta-da-soja, Joaninha,
 Gafanhoto, Lagartas do grupo Heliothinae, Eriopsis connexa, Percevejo, Percevejo-Marrom, Percevejo-verde-ninfa,
@@ -76,7 +85,7 @@ Picamera2 poderia quebrar. O script avisa se as versões divergirem.
 ### 2.4 Configurar o servidor (QR Code)
 Veja a seção 4. Depois:
 ```bash
-scripts/pest-node selftest
+scripts/pest-node --selftest
 ```
 
 ### 2.5 Serviço systemd (sobe no boot, reinicia em falha)
@@ -91,19 +100,30 @@ a rede no boot: o nó funciona offline e reconecta sozinho.
 
 ---
 
-## 3. Uso (CLI)
+## 3. Uso: `main.py`
+
+O nó tem um único ponto de entrada, o [main.py](main.py). Sem opções, ele executa o fluxo de coleta, que é o que o
+systemd roda:
+
+1. **Configuração:** carrega e valida o `config.json` (modelo, câmera, intervalo, limiares).
+2. **Serviços:** carrega o modelo YOLO e sobe a fila de alertas, o WebSocket do app e a leitura de temperatura.
+3. **Câmera:** abre o módulo de câmera; se falhar, tenta de novo a cada 30 s.
+4. **Servidor:** se não houver servidor configurado (ou com `--scan-qr`), lê o QR do servidor por até 120 s.
+   O QR traz a URL e o intervalo de captura.
+5. **Coleta:** a cada `capture_interval_s` segundos, captura um quadro, analisa com o YOLO e, se houver praga acima
+   do limiar, envia a imagem ao servidor.
 
 | Comando | O que faz |
 |---|---|
-| `scripts/pest-node run` | inicia o nó (é o que o systemd executa) |
-| `scripts/pest-node scan-qr [--timeout 120]` | **força** nova leitura do QR e grava `server_ws_url` |
-| `scripts/pest-node set-server ws://IP:8000/ws` | grava a URL manualmente |
-| `scripts/pest-node selftest` | relatório: plataforma, config, modelo, câmera, sensores, rede, servidor, porta, disco/RAM |
-| `scripts/pest-node benchmark [--duration 600]` | benchmark (seção 5) |
-| `scripts/pest-node show-config` | mostra a configuração efetiva |
+| `scripts/pest-node` | inicia o fluxo de coleta (equivale a `.venv/bin/python main.py`) |
+| `scripts/pest-node --scan-qr` | **força** nova leitura do QR (URL + intervalo) e segue rodando |
+| `scripts/pest-node --set-server "ws://IP:8000/ws?capture_interval=5"` | grava o servidor sem QR e sai |
+| `scripts/pest-node --selftest` | relatório: plataforma, config, modelo, câmera, sensores, rede, servidor, porta, disco/RAM |
+| `scripts/pest-node --show-config` | mostra a configuração efetiva |
 
-O nó **só pede o QR se não houver URL válida** no `config.json`. Enquanto não houver, cada quadro da câmera também é
-examinado em busca de um QR: basta mostrar o QR à câmera com o serviço rodando. Achou, grava e conecta.
+Com o serviço instalado, para forçar o QR: `sudo systemctl stop pest-node`, depois `scripts/pest-node --scan-qr` e,
+depois de lido, `Ctrl+C` e `sudo systemctl start pest-node`. Se o servidor não for encontrado na inicialização, cada
+quadro também é examinado em busca de um QR: basta mostrar o QR à câmera com o serviço rodando.
 
 **App Flutter:** na tela "Conectar ao Servidor", use `ws://<ip-do-pi>:8000/ws` (ex.: `ws://192.168.5.19:8000/ws`).
 O app faz o ping/pong e passa a receber as detecções do Pi. Fotos do app com praga acima do limiar também viram
@@ -113,13 +133,19 @@ alerta para o servidor central (`ws_server.forward_alerts`).
 
 ## 4. QR Code do servidor
 
-Conteúdo: texto puro `ws://<ip-do-servidor>:<porta>/ws`, exatamente o que o `servidor_cv` imprime no terminal ao
-iniciar. Também são aceitos `http://` (vira `ws://`) e `https://` (vira `wss://`), e o `/ws` é acrescentado se faltar.
-Isso é a mesma regra do app.
+Conteúdo: `ws://<ip-do-servidor>:<porta>/ws?capture_interval=<segundos>`, exatamente o que o `servidor_cv` imprime no
+terminal ao iniciar. O intervalo é o `CAPTURE_INTERVAL_S` do servidor (padrão 5; faixa 0,5 a 3600; pode ir no `.env`
+do servidor). QR antigo, sem `capture_interval`, também funciona: o nó mantém o intervalo do `config.json`. Também são
+aceitos `http://` (vira `ws://`) e `https://` (vira `wss://`), e o `/ws` é acrescentado se faltar, a mesma regra do
+app.
+
+O **app Flutter continua lendo o mesmo QR**: ele monta `ws://IP:8000/ws?capture_interval=5/ws`, e a rota `/ws` do
+servidor ignora a query string. Isso foi testado com um cliente WebSocket em Python que reproduz a regra do app, não
+com o app em si.
 
 Para imprimir um QR em papel, no PC ou no Pi:
 ```bash
-.venv/bin/python tools/make_qr.py ws://192.168.5.12:8000/ws --out qr_servidor.png
+.venv/bin/python tools/make_qr.py ws://192.168.5.12:8000/ws --interval 5 --out qr_servidor.png
 ```
 Dicas para a ov5647 (foco fixo de ~1 m ao infinito): QR **impresso com 10 cm ou mais**, a cerca de **1 m** da lente,
 bem iluminado e sem reflexo. QR na tela do terminal também funciona, mas com menos confiabilidade.
@@ -129,27 +155,7 @@ Rode o servidor com `--port 8000` (ou ajuste `SERVER_PORT`), senão o QR aponta 
 
 ---
 
-## 5. Benchmark (preenche FPS e latência no Pi)
-
-```bash
-sudo systemctl stop pest-node      # libera a câmera e a CPU
-.venv/bin/python tools/benchmark.py --duration 600                 # 10 min, carga contínua
-.venv/bin/python tools/benchmark.py --duration 600 --threads 4     # compara número de threads
-.venv/bin/python tools/benchmark.py --duration 600 --adaptive      # com o controle térmico ligado
-```
-Gera `bench/bench_<data>.csv`, com uma linha por quadro: `capture_ms`, `preprocess_ms`, `infer_ms`, `postprocess_ms`,
-`e2e_ms` (captura → detecções prontas), `fps_window`, `cpu_pct`, `rss_mb`, `mem_available_mb`, `temp_c`,
-`throttled_hex` e os bits `under_voltage_now`, `freq_capped_now`, `throttled_now`, `soft_temp_limit_now`, além de
-`arm_mhz`. Gera também `bench_<data>.summary.json`, com FPS sustentado, latência média/p50/p95/máx, e2e médio/p95,
-RSS máximo, temperatura máxima e % de quadros com subtensão ou throttling. **O script só mede**: os números saem do
-seu Pi. Sem `--adaptive`, a carga é máxima e contínua, para expor o aquecimento e a subtensão.
-
-Sugestão para o TCC: rode com 1, 2 e 4 threads (`--threads`), depois com e sem dissipador e com fonte boa e fonte
-fraca. Compare `throttled_hex`: o bit de subtensão separa "fonte fraca" de "calor".
-
----
-
-## 6. Configuração (`config.json`)
+## 5. Configuração (`config.json`)
 
 Criado a partir de `config.example.json` e gravado com permissão `600`. Caminhos relativos partem da pasta do
 `config.json`. Chaves desconhecidas ou valores fora da faixa **impedem a inicialização com mensagem clara**
@@ -164,14 +170,16 @@ Criado a partir de `config.example.json` e gravado com permissão `600`. Caminho
 | `model.iou_threshold` | `0.7` | IoU do NMS (padrão do Ultralytics, usado pelo servidor; o app usa 0.45) |
 | `model.max_detections` | `300` | máximo de caixas por imagem |
 | `model.intra_op_num_threads` | `2` | threads do ONNX Runtime (1–4); 2 deixa CPU livre para câmera e rede |
+| `model.imgsz` | `0` | tamanho da entrada; 0 = lê do ONNX (obrigatório só para ONNX com entrada dinâmica) |
+| `model.class_names` | `[]` | nomes das classes na ordem dos índices; vazio = metadados do ONNX |
 | `model.inter_op_num_threads` | `1` | paralelismo entre operadores |
 | `camera.width` / `height` | `1296` / `972` | modo binado da ov5647 com campo de visão completo |
 | `camera.max_fps` | `10` | limite do sensor/ISP (a inferência é bem mais lenta) |
 | `camera.jpeg_quality` | `85` | qualidade do JPEG dos alertas/descarga |
 | `camera.fake_images_dir` | `""` | se preenchido, usa uma pasta de imagens no lugar da câmera |
-| `inference.target_fps` | `0.5` | FPS alvo em condição normal (ajuste pelo benchmark) |
-| `inference.offload_when_degraded` | `true` | envia quadros `STREAM_` ao servidor quando aquecido/estrangulado |
-| `inference.offload_timeout_s` | `15` | espera máxima pela resposta da descarga |
+| `inference.capture_interval_s` | `5` | segundos entre capturas analisadas (vem do QR do servidor; 0,5 a 3600) |
+| `inference.mode` | `auto` | onde o YOLO roda: `auto`, `local` ou `server` (seção 1) |
+| `inference.server_timeout_s` | `15` | espera máxima pela resposta do servidor ao enviar um quadro |
 | `thermal.poll_interval_s` | `5` | intervalo de leitura do `vcgencmd` |
 | `thermal.temp_high_c` / `temp_resume_c` | `70` / `65` | limiares com histerese |
 | `thermal.react_to_throttling` | `true` | reduz carga com bits de throttling/limite térmico ativos |
@@ -200,7 +208,7 @@ ou em variável de ambiente, nunca no código.
 
 ---
 
-## 7. Projeto do software (escolhas impostas pelo hardware)
+## 6. Projeto do software (escolhas impostas pelo hardware)
 
 - **Memória:** captura sob demanda com `queue=False` e 2 buffers no libcamera (a câmera nunca bloqueia e descarta
   quadros antigos sozinha). Um único buffer numpy de quadro e um tensor de entrada `[1,3,640,640]` são reutilizados.
@@ -209,10 +217,11 @@ ou em variável de ambiente, nunca no código.
 - **CPU:** uma única thread de inferência compartilhada entre câmera e app, com prioridade para o app.
 - **Pré-processamento idêntico ao Ultralytics:** letterbox centralizado com cinza 114, BGR→RGB, CHW, `/255`. O
   pós-processamento usa NMS por classe e reescala para pixels originais. Validado contra os JSONs gravados pelo
-  próprio servidor (seção 9).
+  próprio servidor (seção 8).
 - **Térmico:** `vcgencmd measure_temp`, `get_throttled` (todos os bits decodificados) e `measure_clock arm`. Com
-  pressão, o intervalo entre inferências dobra (até `max_interval_s`) e, se possível, o quadro é descarregado para o
-  servidor. Com alívio (≤ `temp_resume_c` e nenhum bit ativo), o intervalo volta gradualmente.
+  pressão, o intervalo entre capturas dobra a partir de `capture_interval_s` (até `max_interval_s`) e, no modo
+  `auto`, o quadro é enviado ao servidor. Com alívio (≤ `temp_resume_c` e nenhum bit ativo), o intervalo volta
+  gradualmente ao `capture_interval_s`.
 - **Offline primeiro:** alertas vão para a fila SQLite e são reenviados com backoff exponencial ao reconectar. Um
   item só sai da fila após o "processado" do servidor (entrega "pelo menos uma vez").
 - **Logs:** console legível (capturado pelo journald) e arquivo JSON por linha com rotação. Os eventos `metrics`
@@ -220,19 +229,19 @@ ou em variável de ambiente, nunca no código.
 
 ```
 src/pest_node/
-  __main__.py   CLI                       runtime.py   orquestração do nó
+  runtime.py    serviços do nó e um ciclo de coleta (collect_once); o fluxo fica no main.py da raiz
   config.py     config.json               detector.py  ONNX Runtime + letterbox + NMS
   discovery.py  QR Code e URL             thermal.py   vcgencmd + controle adaptativo
   camera.py     Picamera2 + câmeras falsas client.py   cliente do servidor (alertas, descarga)
   outbox.py     fila SQLite               ws_server.py WebSocket do app
   protocol.py   quadro binário            alerts.py    limiar + cooldown
-  models.py     contrato (JSON)           selftest.py, bench.py, sysmetrics.py, logging_setup.py
-tools/  export_model.py (PC)  benchmark.py  mock_server.py  make_qr.py
+  models.py     contrato (JSON)           selftest.py, sysmetrics.py, logging_setup.py
+tools/  export_model.py (PC)  mock_server.py  make_qr.py
 ```
 
 ---
 
-## 8. Problemas comuns
+## 7. Problemas comuns
 
 **Câmera não detectada.** Rode `rpicam-hello --list-cameras`; ela deve listar `ov5647`. Se não listar, desligue o Pi,
 reencaixe o cabo flat (contatos virados para o conector HDMI no Pi 3) e confira `camera_auto_detect=1` em
@@ -250,7 +259,7 @@ o desktop (`sudo systemctl set-default multi-user.target`) e mantenha o swap. O 
 700 MB.
 
 **QR não lido.** QR grande (≥ 10 cm), a ~1 m (foco fixo), boa luz, sem reflexo. Teste com
-`scripts/pest-node scan-qr --timeout 60`. Alternativa sem QR: `scripts/pest-node set-server ws://IP:8000/ws`.
+`scripts/pest-node --scan-qr`. Alternativa sem QR: `scripts/pest-node --set-server "ws://IP:8000/ws?capture_interval=5"`.
 QR com conteúdo inválido (não-URL, esquema `ftp://` etc.) é ignorado com aviso `qr_invalid` no log.
 
 **Servidor inacessível.** O `selftest` testa TCP, `GET /` e o ping/pong do WebSocket. Confira se o servidor foi iniciado
@@ -264,24 +273,33 @@ isso, os alertas ficam na fila (`outbox_items` no log) e são enviados quando o 
 
 ---
 
-## 9. O que foi validado e onde
+## 8. O que foi validado e onde
 
 **Validado no PC (Windows, Python 3.13, mesmas versões fixadas), sem o hardware do Pi:**
-- 144 testes automatizados passando (`pytest`; 140 locais + 4 contra o servidor real; 1 teste de permissão `600` só roda em Linux): protocolo binário (Big-Endian, UTF-8, JPEG, quadros corrompidos, little-endian
+- 169 testes automatizados passando (`pytest`; 165 locais + 4 contra o servidor real; 1 teste de permissão `600` só roda em Linux): protocolo binário (Big-Endian, UTF-8, JPEG, quadros corrompidos, little-endian
   por engano), letterbox/reescala/NMS, os três formatos de saída, config inválida, QR válido/inválido, controle
   térmico com sensor simulado (incluindo a leitura real `0x50005`), fila offline, backoff, retry e queda no meio da
   entrega, WebSocket do app (cabeçalho inválido, JPEG corrompido, quadro grande demais, desconexão no meio da
-  mensagem, flood de streaming, caminho errado) e o nó completo com câmera falsa.
+  mensagem, flood de streaming, caminho errado), o fluxo completo do `main.py` com câmera falsa (QR com intervalo,
+  modos `auto`/`local`/`server`) e a migração do `config.json` antigo.
 - **Fidelidade do detector:** nas 18 imagens que o servidor já tinha processado (`servidor_cv/data/`), o detector do
   nó deu as mesmas classes e a mesma quantidade de caixas, com confiança ±0,01 e caixas ±2 px.
-- **Contra o servidor_cv real, sem alterações** (`tests/test_real_server.py`, servidor rodando localmente): ping/pong,
+- **QR com intervalo, contra o servidor_cv alterado:** o servidor imprime `ws://IP:PORTA/ws?capture_interval=5`, o
+  nó lê URL e intervalo, e a URL que o app monta (`...?capture_interval=5/ws`) continua conectando (ping/pong).
+- **Contra o servidor_cv real** (`tests/test_real_server.py`, servidor rodando localmente): ping/pong,
   alerta aceito e **imagem gravada em `classified/`**, descarga `STREAM_`, e resposta do nó idêntica à do servidor
   para o mesmo quadro.
 - Formato JSON conferido contra o `model_dump_json()` do Pydantic 2.7.1 do servidor.
 
-**Ainda NÃO validado (precisa do Pi real):** captura com Picamera2/ov5647, leitura de QR pela câmera física, `vcgencmd`
-real em carga, FPS/latência/RAM/temperatura (rodar o benchmark), serviço systemd no boot, `install.sh` no trixie,
-`selftest` com câmera + modelo + servidor, 10 min contínuos sem estourar RAM, e o app Flutter conectado ao Pi. Também
+**Validado no Pi real (Pi 3 B, trixie, Python 3.13):** venv com `--system-site-packages` + `requirements.txt`;
+captura com Picamera2/ov5647 em 1296x972; leitura do QR do servidor pela câmera física (QR antigo, sem intervalo); `selftest` com
+câmera, modelo, `vcgencmd`, rede e servidor central (8 OK, 1 aviso de subtensão).
+
+**Ainda NÃO validado no Pi:** o novo `main.py`, o QR com `capture_interval` lido pela câmera física, a correção do
+quadro escuro no início da captura (aquecimento de 1,5 s), serviço systemd
+no boot, operação contínua com o controle térmico em carga, uso de RAM em operação longa e o app Flutter conectado
+ao Pi. Não há medição formal de FPS/latência no Pi (fora do escopo do TCC); os logs `metrics` registram esses valores
+durante a operação. Também
 **não foi validada a gravação no PostgreSQL** (o banco não estava rodando no teste local; o servidor responde
 "processado" mesmo quando o banco falha).
 
@@ -294,7 +312,10 @@ REAL_SERVER_URL=ws://127.0.0.1:8000/ws pytest tests/test_real_server.py   # com 
 
 ---
 
-## 10. Observações sobre o contrato (para o autor decidir; nada foi alterado)
+## 9. Observações sobre o contrato
+
+Única alteração feita no servidor (a pedido do autor): `CAPTURE_INTERVAL_S` em `src/core/config.py` e o QR em
+`src/main.py` passaram a levar `?capture_interval=<segundos>`. O resto abaixo continua só como observação.
 
 1. O servidor não tem endpoint de resultados/alertas: o nó usa a persistência de imagens como alerta (seção 1).
 2. O QR do servidor usa `SERVER_PORT`, não a porta real do `uvicorn` (seção 4).

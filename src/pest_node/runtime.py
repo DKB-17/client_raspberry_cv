@@ -1,4 +1,10 @@
-"""Orquestração do nó: câmera -> inferência -> alertas, app WebSocket, térmico, métricas."""
+"""Serviços do nó usados pelo main.py.
+
+O main.py conduz o fluxo (câmera -> QR -> coleta). Esta classe reúne as peças:
+modelo, fila de alertas, cliente do servidor, WebSocket do app, controle
+térmico e métricas, e expõe `collect_once()`, que é UM ciclo da coleta:
+captura -> análise (YOLO no Pi ou no servidor) -> alerta.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +22,7 @@ from .camera import Camera, CameraError, make_camera
 from .client import ServerClient
 from .config import Config
 from .detector import Detector, encode_jpeg
-from .discovery import InvalidServerUrl, decode_qr, normalize_server_url
+from .discovery import InvalidServerUrl, ServerInfo, decode_qr, parse_server_qr
 from .logging_setup import get_logger, log_event
 from .models import AlertEvent, Detection
 from .outbox import Outbox
@@ -27,28 +33,30 @@ from .ws_server import AppGateway, InferenceWorker
 
 log = get_logger("runtime")
 
-CAMERA_RETRY_S = 30.0
-
 
 class Node:
     def __init__(self, cfg: Config, camera: Camera | None = None, sensor: ThermalSensor | None = None,
                  detector: Detector | None = None) -> None:
         self.cfg = cfg
-        self.camera = camera
+        c = cfg.camera
+        self.camera = camera or make_camera(c.width, c.height, c.max_fps,
+                                            cfg.resolve(c.fake_images_dir) if c.fake_images_dir else None)
         self.sensor = sensor or VcgencmdSensor()
         self.detector = detector
+        t = cfg.thermal
         self.controller = AdaptiveController(
-            target_fps=cfg.inference.target_fps, temp_high_c=cfg.thermal.temp_high_c,
-            temp_resume_c=cfg.thermal.temp_resume_c, slowdown_factor=cfg.thermal.slowdown_factor,
-            max_interval_s=cfg.thermal.max_interval_s, react_to_throttling=cfg.thermal.react_to_throttling,
-            react_to_under_voltage=cfg.thermal.react_to_under_voltage)
+            base_interval_s=cfg.inference.capture_interval_s, temp_high_c=t.temp_high_c,
+            temp_resume_c=t.temp_resume_c, slowdown_factor=t.slowdown_factor, max_interval_s=t.max_interval_s,
+            react_to_throttling=t.react_to_throttling, react_to_under_voltage=t.react_to_under_voltage)
         self.policy = AlertPolicy(cfg.alerts.threshold, cfg.alerts.cooldown_s, cfg.alerts.classes)
         self.worker = InferenceWorker()
         self.outbox: Outbox | None = None
         self.client: ServerClient | None = None
         self.gateway: AppGateway | None = None
         self.stop_event = asyncio.Event()
-        # métricas (janela limitada; nada cresce sem limite)
+        self._tasks: list[asyncio.Task[None]] = []
+        self._camera_open = False
+        # métricas (janelas limitadas; nada cresce sem limite)
         self.frames = 0
         self.offloaded = 0
         self.alerts = 0
@@ -56,50 +64,53 @@ class Node:
         self._e2e_ms: deque[float] = deque(maxlen=200)
         self._cpu = CpuMeter()
 
+    @property
+    def interval_s(self) -> float:
+        """Intervalo atual entre capturas (capture_interval_s, ampliado se aquecido)."""
+        return self.controller.interval_s
+
     # ------------------------------------------------------------ ciclo de vida
-    async def run(self) -> None:
+    async def start(self) -> None:
+        """Carrega o modelo e sobe fila, cliente, WebSocket do app, térmico e métricas."""
         cfg = self.cfg
         if self.detector is None:
-            m = cfg.model
-            self.detector = await asyncio.to_thread(
-                Detector, cfg.resolve(m.path), m.conf_threshold, m.iou_threshold, m.max_detections,
-                m.intra_op_num_threads, m.inter_op_num_threads)
+            self.detector = await asyncio.to_thread(Detector.from_config, cfg)
         self.outbox = Outbox(cfg.resolve(cfg.outbox.db_path), cfg.outbox.max_items, cfg.outbox.max_bytes)
         if cfg.server_ws_url:
             await self._start_client(cfg.server_ws_url)
-        else:
-            log_event(log, "server_not_configured", level=30,
-                      hint="mostre o QR do servidor à câmera ou rode `pest-node scan-qr`; alertas ficam na fila")
         if cfg.ws_server.enabled:
             w = cfg.ws_server
             self.gateway = AppGateway(self.detector.detect_jpeg, self.worker, w.host, w.port, w.path,
                                       w.max_frame_bytes, w.max_id_bytes, w.max_pending_photos,
                                       on_alert=self._on_app_photo if w.forward_alerts else None)
             await self.gateway.start()
-        tasks = [asyncio.create_task(self._camera_loop(), name="camera"),
-                 asyncio.create_task(self._thermal_loop(), name="thermal"),
-                 asyncio.create_task(self._metrics_loop(), name="metrics")]
-        log_event(log, "node_started", node_id=cfg.node_id, target_fps=cfg.inference.target_fps,
-                  threads=cfg.model.intra_op_num_threads, server=cfg.server_ws_url or None)
-        try:
-            await self.stop_event.wait()
-        finally:
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await self._shutdown()
+        self._tasks = [asyncio.create_task(self._thermal_loop(), name="thermal"),
+                       asyncio.create_task(self._metrics_loop(), name="metrics")]
 
-    async def _shutdown(self) -> None:
+    async def stop(self) -> None:
+        for t in self._tasks:
+            t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
         if self.gateway:
             await self.gateway.stop()
         if self.client:
             await self.client.stop()
-        if self.camera:
+        if self._camera_open:
             await asyncio.to_thread(self.camera.stop)
+            self._camera_open = False
         self.worker.shutdown()
         if self.outbox:
             self.outbox.close()
         log_event(log, "node_stopped", frames=self.frames, alerts=self.alerts)
+
+    async def open_camera(self) -> bool:
+        try:
+            await asyncio.to_thread(self.camera.start)
+        except CameraError as exc:
+            log_event(log, "camera_unavailable", level=40, error=str(exc))
+            return False
+        self._camera_open = True
+        return True
 
     async def _start_client(self, url: str) -> None:
         assert self.outbox is not None and self.detector is not None
@@ -108,83 +119,71 @@ class Node:
                                    o.backoff_initial_s, o.backoff_max_s, o.response_timeout_s)
         await self.client.start()
 
-    # ------------------------------------------------------------ câmera
-    async def _open_camera(self) -> Camera | None:
-        c = self.cfg.camera
-        if self.camera is None:
-            fake = self.cfg.resolve(c.fake_images_dir) if c.fake_images_dir else None
-            self.camera = make_camera(c.width, c.height, c.max_fps, fake)
-        try:
-            await asyncio.to_thread(self.camera.start)
-            return self.camera
-        except CameraError as exc:
-            log_event(log, "camera_unavailable", level=40, error=str(exc), retry_in_s=CAMERA_RETRY_S)
-            self.camera = None
-            return None
+    async def use_server(self, info: ServerInfo) -> None:
+        """Aplica o que veio do QR: URL do servidor e intervalo de captura. Grava no config.json."""
+        self.cfg.server_ws_url = info.url
+        if info.capture_interval_s is not None:
+            self.cfg.inference.capture_interval_s = info.capture_interval_s
+            self.controller.set_base_interval(info.capture_interval_s)
+        await asyncio.to_thread(cfgmod.save, self.cfg)
+        log_event(log, "server_configured", url=info.url, capture_interval_s=self.cfg.inference.capture_interval_s)
+        if self.client is not None:
+            await self.client.stop()
+        await self._start_client(info.url)
 
-    async def _camera_loop(self) -> None:
-        camera = None
-        while camera is None:
-            camera = await self._open_camera()
-            if camera is None:
-                await asyncio.sleep(CAMERA_RETRY_S)  # o WebSocket do app segue funcionando
-        while True:
-            started = time.monotonic()
-            try:
-                await self._process_frame(camera)
-            except CameraError as exc:
-                log_event(log, "camera_error", level=40, error=str(exc))
-                await asyncio.sleep(5)
-            except Exception:
-                log.exception("erro inesperado no ciclo da câmera")
-                await asyncio.sleep(5)
-            elapsed = time.monotonic() - started
-            await asyncio.sleep(max(0.0, self.controller.interval_s - elapsed))
-
-    async def _process_frame(self, camera: Camera) -> None:
+    # ------------------------------------------------------------ um ciclo da coleta
+    async def collect_once(self) -> list[Detection]:
+        """Captura um quadro, analisa com o YOLO e dispara alerta se houver praga."""
         t0 = time.perf_counter()
-        frame = await asyncio.to_thread(camera.capture)
+        frame = await asyncio.to_thread(self.camera.capture)
         if not self.cfg.server_ws_url:
             await self._try_discover(frame)
-        jpeg: bytes | None = None
-        detections: list[Detection] | None = None
-        source = "local"
-        if self.controller.degraded and self.cfg.inference.offload_when_degraded and self.client \
-                and self.client.connected:
-            jpeg = await asyncio.to_thread(encode_jpeg, frame, self.cfg.camera.jpeg_quality)
-            detections = await self.client.offload(jpeg, self.cfg.inference.offload_timeout_s)
-            if detections is not None:
-                source = "server"
-                self.offloaded += 1
-        if detections is None:
-            assert self.detector is not None
-            result = await self.worker.run_camera(self.detector.detect, frame)
-            detections = result.detections
-            self._infer_ms.append(result.inference_ms)
+        detections, source, jpeg = await self._analyze(frame)
         self.frames += 1
         self._e2e_ms.append((time.perf_counter() - t0) * 1e3)
         if detections:
             log_event(log, "detections", source=source,
                       found=[f"{d.class_name}:{d.confidence:.2f}" for d in detections])
-        hits = self.policy.triggering(detections)
-        if hits:
+        if self.policy.triggering(detections):
             if jpeg is None:
                 jpeg = await asyncio.to_thread(encode_jpeg, frame, self.cfg.camera.jpeg_quality)
             await self._raise_alert(jpeg, detections, "camera")
+        return detections
+
+    def _send_to_server(self) -> bool:
+        mode = self.cfg.inference.mode
+        connected = self.client is not None and self.client.connected
+        if mode == "server":
+            return connected
+        if mode == "auto":
+            return connected and self.controller.degraded
+        return False
+
+    async def _analyze(self, frame: np.ndarray) -> tuple[list[Detection], str, bytes | None]:
+        """YOLO no servidor (quadro STREAM_, não é gravado) ou no Pi, conforme inference.mode."""
+        jpeg: bytes | None = None
+        if self._send_to_server():
+            assert self.client is not None
+            jpeg = await asyncio.to_thread(encode_jpeg, frame, self.cfg.camera.jpeg_quality)
+            detections = await self.client.offload(jpeg, self.cfg.inference.server_timeout_s)
+            if detections is not None:
+                self.offloaded += 1
+                return detections, "server", jpeg
+        assert self.detector is not None
+        result = await self.worker.run_camera(self.detector.detect, frame)
+        self._infer_ms.append(result.inference_ms)
+        return result.detections, "local", jpeg
 
     async def _try_discover(self, frame: np.ndarray) -> None:
         text = await asyncio.to_thread(decode_qr, frame)
         if not text:
             return
         try:
-            url = normalize_server_url(text)
+            info = parse_server_qr(text)
         except InvalidServerUrl as exc:
             log_event(log, "qr_invalid", level=30, reason=str(exc))
             return
-        self.cfg.server_ws_url = url
-        await asyncio.to_thread(cfgmod.save, self.cfg)
-        log_event(log, "server_discovered", url=url)
-        await self._start_client(url)
+        await self.use_server(info)
 
     # ------------------------------------------------------------ alertas
     async def _on_app_photo(self, packet: ImagePacket, detections: list[Detection]) -> None:
@@ -198,7 +197,7 @@ class Node:
                   classes=sorted({d.class_name for d in detections if d.confidence >= self.policy.threshold}))
         if self.client is not None:
             await self.client.enqueue_alert(event)
-        else:
+        else:  # servidor ainda não configurado: fica na fila até o QR ser lido
             assert self.outbox is not None
             dets = json.dumps([d.to_wire() for d in detections], ensure_ascii=False)
             await asyncio.to_thread(self.outbox.put, event.packet_id, jpeg, dets, origin, event.created_at)
@@ -229,7 +228,9 @@ class Node:
             "infer_ms_avg": round(statistics.fmean(infer), 1) if infer else None,
             "infer_ms_p95": round(_p95(infer), 1) if infer else None,
             "e2e_ms_avg": round(statistics.fmean(e2e), 1) if e2e else None,
+            "capture_interval_s": self.cfg.inference.capture_interval_s,
             "interval_s": round(self.controller.interval_s, 2),
+            "mode": self.cfg.inference.mode,
             "load_reason": self.controller.reason,
             "temp_c": s.temp_c if s else None,
             "throttled": s.flags.describe() if s and s.flags else None,

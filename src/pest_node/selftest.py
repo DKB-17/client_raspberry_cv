@@ -67,8 +67,7 @@ def check_config(cfg: Config, path) -> tuple[str, str]:
 
 def check_model(cfg: Config) -> tuple[str, str]:
     m = cfg.model
-    det = Detector(cfg.resolve(m.path), m.conf_threshold, m.iou_threshold, m.max_detections,
-                   m.intra_op_num_threads, m.inter_op_num_threads)
+    det = Detector.from_config(cfg)
     blank = np.full((cfg.camera.height, cfg.camera.width, 3), 114, np.uint8)
     det.detect(blank)  # aquecimento
     t = time.perf_counter()
@@ -88,8 +87,8 @@ def check_camera(cfg: Config) -> tuple[str, str]:
     finally:
         cam.stop()
     kind = "FALSA (pasta)" if c.fake_images_dir else "Picamera2"
-    status = WARN if mean < 5 else OK
-    hint = " | imagem quase preta: tampa da lente?" if status == WARN else ""
+    status = WARN if mean < 20 else OK
+    hint = " | imagem muito escura: tampa da lente, pouca luz ou exposição não convergiu" if status == WARN else ""
     return status, f"{kind} | quadro {frame.shape[1]}x{frame.shape[0]} | brilho médio {mean:.0f}{hint}"
 
 
@@ -109,7 +108,7 @@ def check_thermal() -> tuple[str, str]:
 
 def check_network(cfg: Config) -> tuple[str, str]:
     if not cfg.server_ws_url:
-        return WARN, "servidor não configurado (rode `pest-node scan-qr`)"
+        return WARN, "servidor não configurado (rode `python main.py --scan-qr`)"
     parts = urlsplit(cfg.server_ws_url)
     port = parts.port or (443 if parts.scheme == "wss" else 80)
     t = time.perf_counter()

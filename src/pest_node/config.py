@@ -32,6 +32,8 @@ class ModelConfig:
     max_detections: int = 300
     intra_op_num_threads: int = 2
     inter_op_num_threads: int = 1
+    imgsz: int = 0  # 0 = lê do próprio ONNX; obrigatório só para modelos com entrada dinâmica
+    class_names: list[str] = field(default_factory=list)  # vazio = nomes dos metadados do ONNX
 
 
 @dataclass
@@ -43,11 +45,20 @@ class CameraConfig:
     fake_images_dir: str = ""  # se preenchido, usa a câmera falsa (pasta de imagens)
 
 
+PROCESSING_MODES = ("auto", "local", "server")
+
+
 @dataclass
 class InferenceConfig:
-    target_fps: float = 0.5  # conservador para o Pi 3; ajuste pelo benchmark
-    offload_when_degraded: bool = True  # envia quadros STREAM_ ao servidor se aquecido/estrangulado
-    offload_timeout_s: float = 15.0
+    # De quantos em quantos segundos um quadro é capturado e analisado pelo YOLO.
+    # Vem do QR Code do servidor (CAPTURE_INTERVAL_S); pode ser ajustado aqui.
+    capture_interval_s: float = 5.0
+    # Onde o YOLO roda:
+    #   "auto"   no Pi; quando aquecido/estrangulado, envia o quadro ao servidor
+    #   "local"  sempre no Pi
+    #   "server" sempre no servidor (quadro STREAM_); se o servidor cair, roda no Pi
+    mode: str = "auto"
+    server_timeout_s: float = 15.0  # espera pela resposta do servidor ao enviar um quadro
 
 
 @dataclass
@@ -194,15 +205,17 @@ def validate(cfg: Config) -> None:
              "camera.width/height fora da faixa do sensor (máx. 2592x1944)")
     _require(0.5 <= c.max_fps <= 60, "camera.max_fps deve estar entre 0.5 e 60")
     _require(10 <= c.jpeg_quality <= 100, "camera.jpeg_quality deve estar entre 10 e 100")
-    _require(0.01 <= i.target_fps <= 30, "inference.target_fps deve estar entre 0.01 e 30")
-    _require(i.offload_timeout_s > 0, "inference.offload_timeout_s deve ser > 0")
+    _require(0.5 <= i.capture_interval_s <= 3600, "inference.capture_interval_s deve estar entre 0.5 e 3600 s")
+    _require(i.mode in PROCESSING_MODES, f"inference.mode deve ser um de: {', '.join(PROCESSING_MODES)}")
+    _require(i.server_timeout_s > 0, "inference.server_timeout_s deve ser > 0")
+    _require(m.imgsz == 0 or (32 <= m.imgsz <= 2048 and m.imgsz % 32 == 0),
+             "model.imgsz deve ser 0 (automático) ou múltiplo de 32 entre 32 e 2048")
     _require(t.poll_interval_s >= 1, "thermal.poll_interval_s deve ser >= 1")
     _require(30 <= t.temp_high_c <= 85, "thermal.temp_high_c deve estar entre 30 e 85 °C")
     _require(t.temp_resume_c < t.temp_high_c,
              "thermal.temp_resume_c deve ser menor que thermal.temp_high_c (histerese)")
     _require(t.slowdown_factor > 1.0, "thermal.slowdown_factor deve ser > 1")
-    _require(t.max_interval_s >= 1.0 / i.target_fps,
-             "thermal.max_interval_s deve ser >= 1/inference.target_fps")
+    _require(t.max_interval_s >= 1.0, "thermal.max_interval_s deve ser >= 1")
     _require(0.0 < a.threshold <= 1.0, "alerts.threshold deve estar entre 0 e 1")
     _require(a.threshold >= m.conf_threshold,
              "alerts.threshold não pode ser menor que model.conf_threshold")
@@ -241,7 +254,30 @@ def default_path() -> Path:
     return Path(env) if env else DEFAULT_CONFIG_PATH
 
 
+def _migrate(data: dict[str, Any]) -> bool:
+    """Converte chaves de versões anteriores do config.json. Retorna True se mudou algo."""
+    inf = data.get("inference")
+    if not isinstance(inf, dict):
+        return False
+    changed = False
+    if "target_fps" in inf:
+        fps = inf.pop("target_fps")
+        if "capture_interval_s" not in inf and isinstance(fps, (int, float)) and fps > 0:
+            inf["capture_interval_s"] = round(1.0 / fps, 3)
+        changed = True
+    if "offload_when_degraded" in inf:
+        offload = inf.pop("offload_when_degraded")
+        inf.setdefault("mode", "auto" if offload else "local")
+        changed = True
+    if "offload_timeout_s" in inf:
+        inf.setdefault("server_timeout_s", inf.pop("offload_timeout_s"))
+        changed = True
+    return changed
+
+
 def from_dict(data: dict[str, Any], base_dir: Path = Path(".")) -> Config:
+    data = json.loads(json.dumps(data))  # cópia profunda
+    _migrate(data)
     cfg = _build(Config, data, "")
     cfg.base_dir = base_dir
     validate(cfg)
@@ -266,6 +302,8 @@ def load(path: Path | None = None, create: bool = True) -> Config:
         except OSError as exc:
             raise ConfigError(f"{path}: não foi possível ler ({exc})") from exc
         cfg = from_dict(data, base_dir=path.parent)
+        if _migrate(data):  # grava já no formato novo
+            save(cfg, path)
     if not cfg.node_id or not path.exists():
         cfg.node_id = cfg.node_id or str(uuid.uuid4())
         save(cfg, path)

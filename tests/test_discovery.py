@@ -2,8 +2,8 @@ import cv2
 import numpy as np
 import pytest
 
-from pest_node.discovery import (InvalidServerUrl, decode_qr, http_base_url, normalize_server_url,
-                                 scan_for_server_url)
+from pest_node.discovery import (InvalidServerUrl, ServerInfo, decode_qr, http_base_url, normalize_server_url,
+                                 parse_server_qr, scan_for_server_url)
 
 
 @pytest.mark.parametrize("raw, expected", [
@@ -12,6 +12,7 @@ from pest_node.discovery import (InvalidServerUrl, decode_qr, http_base_url, nor
     ("http://192.168.5.10:8000", "ws://192.168.5.10:8000/ws"),
     ("https://srv.local:8443/", "wss://srv.local:8443/ws"),
     ("WS://10.0.0.2:8000/ws", "ws://10.0.0.2:8000/ws"),
+    ("ws://192.168.5.12:8000/ws?capture_interval=5", "ws://192.168.5.12:8000/ws"),
 ])
 def test_normalize_valid(raw, expected):
     assert normalize_server_url(raw) == expected
@@ -49,8 +50,37 @@ def test_decode_qr_none_on_blank():
 def test_scan_skips_invalid_then_finds_valid():
     frames = iter([_qr_image("isto nao e url"), np.zeros((100, 100, 3), np.uint8),
                    _qr_image("ws://10.1.1.1:8000/ws")])
-    url = scan_for_server_url(lambda: next(frames), timeout_s=5, interval_s=0)
-    assert url == "ws://10.1.1.1:8000/ws"
+    info = scan_for_server_url(lambda: next(frames), timeout_s=5, interval_s=0)
+    assert info == ServerInfo("ws://10.1.1.1:8000/ws", None)
+
+
+@pytest.mark.parametrize("raw, expected", [
+    # formato gerado pelo servidor_cv (src/main.py): f"{ws_url}?capture_interval={CAPTURE_INTERVAL_S:g}"
+    ("ws://192.168.5.12:8000/ws?capture_interval=5", ServerInfo("ws://192.168.5.12:8000/ws", 5.0)),
+    ("ws://192.168.5.12:8000/ws?capture_interval=0.5", ServerInfo("ws://192.168.5.12:8000/ws", 0.5)),
+    ("ws://192.168.5.12:8000/ws?capture_interval=3600", ServerInfo("ws://192.168.5.12:8000/ws", 3600.0)),
+    ("ws://192.168.5.12:8000/ws", ServerInfo("ws://192.168.5.12:8000/ws", None)),  # QR antigo
+    ("http://192.168.5.12:8000?capture_interval=10", ServerInfo("ws://192.168.5.12:8000/ws", 10.0)),
+])
+def test_parse_server_qr(raw, expected):
+    assert parse_server_qr(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [
+    "ws://h:8000/ws?capture_interval=abc", "ws://h:8000/ws?capture_interval=0",
+    "ws://h:8000/ws?capture_interval=-5", "ws://h:8000/ws?capture_interval=99999",
+    "ws://h:8000/ws?capture_interval=nan", "ws://h:8000/ws?capture_interval=",
+    "ws://h:8000/ws?capture_interval=5&outro=1",
+])
+def test_parse_server_qr_invalid_interval(raw):
+    with pytest.raises(InvalidServerUrl):
+        parse_server_qr(raw)
+
+
+def test_scan_reads_interval_from_server_qr():
+    frame = _qr_image("ws://192.168.5.12:8000/ws?capture_interval=5")
+    info = scan_for_server_url(lambda: frame, timeout_s=5, interval_s=0)
+    assert info.capture_interval_s == 5.0
 
 
 def test_scan_timeout():

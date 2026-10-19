@@ -1,10 +1,10 @@
 """Gera um PNG com o QR Code da URL do servidor, para imprimir ou mostrar na tela.
 
-O conteúdo é o mesmo que o servidor_cv imprime no terminal: "ws://<ip>:<porta>/ws".
-Usa apenas o OpenCV (sem dependências extras).
+O conteúdo é o mesmo que o servidor_cv imprime no terminal:
+"ws://<ip>:<porta>/ws?capture_interval=<segundos>". Usa apenas o OpenCV.
 
-    python tools/make_qr.py ws://192.168.5.12:8000/ws
-    python tools/make_qr.py ws://192.168.5.12:8000/ws --out qr_servidor.png --size 1200
+    python tools/make_qr.py ws://192.168.5.12:8000/ws --interval 5
+    python tools/make_qr.py "ws://192.168.5.12:8000/ws?capture_interval=5" --out qr_servidor.png
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from pathlib import Path
 import cv2
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from pest_node.discovery import InvalidServerUrl, decode_qr, normalize_server_url  # noqa: E402
+from pest_node.discovery import CAPTURE_INTERVAL_PARAM, InvalidServerUrl, decode_qr, parse_server_qr  # noqa: E402
 
 
 def main() -> int:
@@ -24,9 +24,13 @@ def main() -> int:
     p.add_argument("url")
     p.add_argument("--out", type=Path, default=Path("qr_servidor.png"))
     p.add_argument("--size", type=int, default=1000, help="lado da imagem em pixels")
+    p.add_argument("--interval", type=float, default=None, help="intervalo de captura em segundos")
     args = p.parse_args()
     try:
-        url = normalize_server_url(args.url)
+        info = parse_server_qr(args.url)
+        interval = args.interval if args.interval is not None else info.capture_interval_s
+        url = info.url if interval is None else f"{info.url}?{CAPTURE_INTERVAL_PARAM}={interval:g}"
+        parse_server_qr(url)  # valida a faixa do intervalo
     except InvalidServerUrl as exc:
         print(f"ERRO: {exc}", file=sys.stderr)
         return 2

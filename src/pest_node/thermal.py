@@ -162,10 +162,11 @@ class AdaptiveController:
       a cada leitura até voltar ao intervalo base. Entre os dois limiares, mantém
       (histerese).
     Aumentar o intervalo equivale a pular quadros: a câmera continua rodando,
-    apenas menos quadros são inferidos.
+    apenas menos quadros são inferidos. O intervalo base é o intervalo de
+    captura (inference.capture_interval_s, vindo do QR do servidor).
     """
 
-    target_fps: float
+    base_interval_s: float
     temp_high_c: float = 70.0
     temp_resume_c: float = 65.0
     slowdown_factor: float = 2.0
@@ -177,12 +178,18 @@ class AdaptiveController:
     last_sample: ThermalSample | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
-        self.base_interval_s = 1.0 / self.target_fps
         self.interval_s = self.base_interval_s
+        self._under_pressure = False
 
     @property
     def degraded(self) -> bool:
-        return self.interval_s > self.base_interval_s * 1.0001
+        return self._under_pressure or self.interval_s > self.base_interval_s * 1.0001
+
+    def set_base_interval(self, seconds: float) -> None:
+        """Novo intervalo de captura (ex.: QR relido). Mantém a redução térmica atual."""
+        factor = self.interval_s / self.base_interval_s
+        self.base_interval_s = seconds
+        self.interval_s = min(seconds * factor, max(self.max_interval_s, seconds))
 
     def _pressure(self, s: ThermalSample) -> list[str]:
         causes: list[str] = []
@@ -204,8 +211,10 @@ class AdaptiveController:
         self.last_sample = sample
         previous = self.interval_s
         causes = self._pressure(sample)
+        self._under_pressure = bool(causes)
         if causes:
-            self.interval_s = min(self.interval_s * self.slowdown_factor, self.max_interval_s)
+            ceiling = max(self.max_interval_s, self.base_interval_s)
+            self.interval_s = min(self.interval_s * self.slowdown_factor, ceiling)
             self.reason = "+".join(causes)
         elif self._relieved(sample) and self.degraded:
             self.interval_s = max(self.interval_s / self.slowdown_factor, self.base_interval_s)

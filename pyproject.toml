@@ -11,9 +11,6 @@ requires-python = ">=3.11"
 # para que o pip não substitua o numpy do apt usado pelo Picamera2.
 dependencies = []
 
-[project.scripts]
-pest-node = "pest_node.__main__:main"
-
 [tool.setuptools.packages.find]
 where = ["src"]
 

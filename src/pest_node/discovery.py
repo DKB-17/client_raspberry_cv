@@ -5,13 +5,16 @@ conteúdo é texto puro "ws://<ip_local>:<SERVER_PORT>/ws". A normalização aba
 replica a do app (app_flutter_cv/.../config_page.dart):
   - aceita ws://, wss://, http:// (vira ws://) e https:// (vira wss://);
   - acrescenta "/ws" ao final se faltar.
+O servidor também envia no QR o intervalo de captura dos nós, como query string:
+  ws://<ip>:8000/ws?capture_interval=5   (segundos entre quadros analisados)
 """
 
 from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from urllib.parse import urlsplit, urlunsplit
+from dataclasses import dataclass
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import cv2
 import numpy as np
@@ -21,6 +24,9 @@ from .logging_setup import get_logger, log_event
 log = get_logger("discovery")
 
 MAX_URL_LEN = 512
+CAPTURE_INTERVAL_PARAM = "capture_interval"
+MIN_CAPTURE_INTERVAL_S = 0.5  # mesma faixa do servidor (CAPTURE_INTERVAL_S)
+MAX_CAPTURE_INTERVAL_S = 3600.0
 _SCHEMES = {"ws": "ws", "wss": "wss", "http": "ws", "https": "wss"}
 
 
@@ -28,8 +34,35 @@ class InvalidServerUrl(ValueError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class ServerInfo:
+    url: str  # ws(s)://host:porta/ws, sem query string
+    capture_interval_s: float | None  # None se o QR não trouxer o intervalo
+
+
+def parse_server_qr(text: str) -> ServerInfo:
+    """Valida o conteúdo do QR e separa a URL do intervalo de captura."""
+    url = normalize_server_url(text)
+    query = parse_qs(urlsplit(text.strip()).query, keep_blank_values=True)
+    values = query.get(CAPTURE_INTERVAL_PARAM)
+    if not values:
+        return ServerInfo(url, None)
+    try:
+        interval = float(values[-1])
+    except ValueError as exc:
+        raise InvalidServerUrl(f"{CAPTURE_INTERVAL_PARAM} inválido: {values[-1]!r}") from exc
+    if not MIN_CAPTURE_INTERVAL_S <= interval <= MAX_CAPTURE_INTERVAL_S:
+        raise InvalidServerUrl(f"{CAPTURE_INTERVAL_PARAM} fora da faixa "
+                               f"{MIN_CAPTURE_INTERVAL_S:g}–{MAX_CAPTURE_INTERVAL_S:g} s: {interval:g}")
+    return ServerInfo(url, interval)
+
+
 def normalize_server_url(text: str) -> str:
-    """Valida e normaliza o conteúdo lido do QR para ws(s)://host[:porta]/.../ws."""
+    """Valida e normaliza o conteúdo lido do QR para ws(s)://host[:porta]/.../ws.
+
+    A query string só pode conter `capture_interval` (lido por parse_server_qr) e
+    é removida da URL de conexão.
+    """
     if not isinstance(text, str):
         raise InvalidServerUrl("conteúdo não é texto")
     url = text.strip()
@@ -53,8 +86,11 @@ def normalize_server_url(text: str) -> str:
         raise InvalidServerUrl("porta inválida")
     if parts.username or parts.password:
         raise InvalidServerUrl("credenciais na URL não são permitidas")
-    if parts.query or parts.fragment:
-        raise InvalidServerUrl("URL não deve ter query string nem fragmento")
+    if parts.fragment:
+        raise InvalidServerUrl("URL não deve ter fragmento")
+    unknown = set(parse_qs(parts.query, keep_blank_values=True)) - {CAPTURE_INTERVAL_PARAM}
+    if unknown:
+        raise InvalidServerUrl(f"parâmetro(s) desconhecido(s) na URL: {', '.join(sorted(unknown))}")
     path = parts.path or ""
     if not path.endswith("/ws"):
         path = path + ("ws" if path.endswith("/") else "/ws")
@@ -85,7 +121,7 @@ def decode_qr(frame_bgr: np.ndarray) -> str | None:
 
 
 def scan_for_server_url(capture: Callable[[], np.ndarray], timeout_s: float = 120.0,
-                        interval_s: float = 0.3) -> str:
+                        interval_s: float = 0.3) -> ServerInfo:
     """Lê quadros até achar um QR com URL válida ou estourar o tempo.
 
     QRs com conteúdo inválido são registrados e ignorados (continua procurando).
@@ -96,9 +132,9 @@ def scan_for_server_url(capture: Callable[[], np.ndarray], timeout_s: float = 12
         text = decode_qr(capture())
         if text:
             try:
-                url = normalize_server_url(text)
-                log_event(log, "qr_found", url=url)
-                return url
+                info = parse_server_qr(text)
+                log_event(log, "qr_found", url=info.url, capture_interval_s=info.capture_interval_s)
+                return info
             except InvalidServerUrl as exc:
                 if text != last_invalid:
                     log_event(log, "qr_invalid", level=30, content=text[:80], reason=str(exc))
